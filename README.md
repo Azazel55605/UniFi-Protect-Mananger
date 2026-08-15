@@ -220,10 +220,16 @@ cargo clippy --all-targets
 cd web && pnpm run typecheck  # frontend
 ```
 
-CI runs all three on every push and pull request, builds the image, and
-publishes it to `ghcr.io` from `main` and from `v*` tags. It also fails if
-`types.gen.ts` is out of date, which is the one way the contract could drift
-without anything else noticing.
+CI runs all three on every push and pull request, and fails if `types.gen.ts`
+is out of date — the one way the contract could drift without anything else
+noticing. The image is built and published to `ghcr.io` only for a `v*` tag:
+
+```bash
+git tag v0.1.6 && git push origin v0.1.6
+```
+
+That publishes `0.1.6`, `0.1` and `latest`. A prerelease tag (`v0.2.0-rc1`)
+publishes only its own version and leaves `latest` alone.
 
 `crates/protect-api-types` is the API contract. `cargo test -p protect-api-types`
 regenerates `web/src/lib/types.gen.ts`, which is committed — so a change to a

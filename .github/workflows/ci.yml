@@ -73,8 +73,11 @@ jobs:
   image:
     name: Image
     runs-on: ubuntu-latest
-    # The image is only worth building once the code that goes in it is known
-    # good, and only worth publishing from the main branch and release tags.
+    # Releases only. Every ordinary push still gets clippy, tests and a
+    # typecheck; what it does not get is a ten-minute image build and a package
+    # nobody asked for. Tagging is the moment you have decided a build is worth
+    # keeping, so that is the moment it is built.
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [rust, web]
     permissions:
       contents: read
@@ -85,7 +88,6 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Sign in to the registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -98,19 +100,21 @@ jobs:
           # The action lowercases the repository name, which ghcr requires and
           # this repository's name does not already satisfy.
           images: ghcr.io/${{ github.repository }}
+          # v0.2.0 publishes 0.2.0, 0.2 and latest. The floating tags are what
+          # a compose file can track without being edited for every release.
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
+          # `latest=auto` moves `latest` only for a plain release, so tagging
+          # v0.3.0-rc1 to try something does not hand it to everyone pulling
+          # `latest` — it publishes 0.3.0-rc1 and nothing else.
+          flavor: latest=auto
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          # A pull request builds the image to prove the Dockerfile still works,
-          # but publishes nothing.
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
