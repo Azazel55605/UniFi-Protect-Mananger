@@ -41,6 +41,8 @@ storage on a schedule, and see whether the pipeline is actually working.
   pin you to one screen
 - Capacity: filesystem usage, how fast footage is growing, roughly how long the
   space lasts, and where it is going per camera
+- A timeline of any day as a strip of marks, with thumbnails and inline
+  playback; the original recording is always downloadable untouched
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 
@@ -94,7 +96,7 @@ than showing an empty list.
 | ✅ | **Event feed** | Indexes the backup service's event database, reads camera names and detection types out of clip filenames, filters by camera, type, detection and clip state |
 | ✅ | **Archiving** | Packs old clips into per-camera monthly archives, verifies every file before deleting anything, runs on a schedule, and browses, verifies and restores archives |
 | ✅ | **Capacity dashboard** | Filesystem usage, growth over time, live vs archived split, per-camera breakdown |
-| ⬜ | **Timeline and playback** | Scrubbable timeline with thumbnails; clips are HEVC, so playback transcodes on demand |
+| ✅ | **Timeline and playback** | A day as a strip of marks, thumbnails, and inline playback — clips are HEVC, so they are transcoded on demand and cached |
 | ⬜ | **Mobile layouts** | Desktop-first for now; the timeline needs a different treatment on a phone |
 
 ## Configuration
@@ -141,6 +143,10 @@ deploying this for the first time should not require hand-editing config.
 | `GET/PUT /api/schedule` | The archive schedule |
 | `GET /api/storage` | Filesystem usage, live vs archived split, growth rate |
 | `GET /api/storage/history?days=N` | Sampled usage history for the trend |
+| `GET /api/media/{id}/info` | Codec, and whether playback needs preparing first |
+| `GET /api/media/{id}/thumb` | Cached still from the clip |
+| `GET /api/media/{id}/clip` | A clip the browser can play, transcoding if needed |
+| `GET /api/media/{id}/original` | The recording itself, untouched |
 | `GET /ws/progress` | Live job progress (WebSocket) |
 | `GET /ws/logs?tail=N` | Live container logs (WebSocket) |
 
@@ -199,6 +205,12 @@ A few decisions that are easy to mistake for accidents:
 - **An archive that already exists is never overwritten**, and its sources are
   never deleted on the strength of it — we only remove originals for an archive
   this app wrote and verified in the same run.
+- **Clips are transcoded on demand, not in advance.** The recordings are HEVC,
+  which Firefox cannot play at all on Linux and Chromium only plays with
+  platform hardware support. The live window holds thousands of clips and
+  almost none are ever watched, so converting them all would spend hours of
+  CPU producing files nobody opens. The first play of a recording takes a few
+  seconds; the result is cached, and evicted when the clip is archived.
 - **Capacity comes from the filesystem, not a storage appliance's API.**
   `statvfs` works on any host, needs no credentials, and can't go stale against
   a vendor's API version. It reports the filesystem as mounted rather than the

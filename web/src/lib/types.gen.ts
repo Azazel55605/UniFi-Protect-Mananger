@@ -93,6 +93,23 @@ export type CameraUsage = { camera: string, live_bytes: number, archive_bytes: n
 export type Check = { ok: boolean, detail: string, };
 
 /**
+ * What playing a clip will involve, so the UI can be honest about a wait.
+ */
+export type ClipInfo = { id: string, available: boolean, 
+/**
+ * Why it isn't, when it isn't.
+ */
+reason: string | null, codec: string | null, 
+/**
+ * True when the browser can play the recording as-is.
+ */
+direct: boolean, 
+/**
+ * True when a transcode already exists, so playback starts immediately.
+ */
+prepared: boolean, };
+
+/**
  * Where a clip's bytes are, which is not the same as whether an event exists.
  */
 export type ClipStatus = "Live" | "Archived" | "Vanished" | "PendingBackfill" | "NeverBackedUp";

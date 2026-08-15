@@ -1,7 +1,7 @@
-# Debian rather than Alpine, deliberately: this image will run the archival
-# logic, and BusyBox's coreutils differ from GNU's in ways that bite scripts
-# written against the latter. ffmpeg joins the runtime stage when thumbnails
-# and transcoding arrive.
+# Debian rather than Alpine, deliberately: this image runs the archival logic,
+# and BusyBox's coreutils differ from GNU's in ways that bite scripts written
+# against the latter. ffmpeg is here because the recordings are HEVC, which
+# most browsers will not play — see the media module.
 
 FROM node:26-bookworm-slim AS web
 WORKDIR /web
@@ -38,7 +38,7 @@ RUN touch crates/protect-api-types/src/lib.rs crates/protect-manager/src/main.rs
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Runs unprivileged. The clip directory is owned by whichever uid/gid the backup

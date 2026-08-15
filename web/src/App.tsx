@@ -9,9 +9,9 @@ import { OverviewPage } from "@/features/overview/OverviewPage";
 import { EventsPage } from "@/features/events/EventsPage";
 import { ArchivePage } from "@/features/archive/ArchivePage";
 import { CapacityPage } from "@/features/storage/CapacityPage";
+import { TimelinePage } from "@/features/timeline/TimelinePage";
 import { LogsPage } from "@/features/logs/LogsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
-import { Placeholder } from "@/features/placeholder";
 import { ProgressProvider } from "@/lib/progress";
 
 export function App() {
@@ -67,16 +67,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/events" element={<EventsPage />} />
-          <Route
-            path="/timeline"
-            element={
-              <Placeholder
-                title="Timeline"
-                description="A scrubbable day of footage with thumbnails, and clip playback in place."
-                waitingOn="the event index and transcoding"
-              />
-            }
-          />
+          <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/archive" element={<ArchivePage />} />
           <Route path="/storage" element={<CapacityPage />} />
           <Route path="/logs" element={<LogsPage />} />

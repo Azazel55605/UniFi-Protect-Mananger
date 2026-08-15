@@ -13,6 +13,7 @@ mod db;
 mod docker;
 mod events;
 mod health;
+mod media;
 mod setup;
 mod storage;
 mod upb;
@@ -27,8 +28,10 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use futures_util::StreamExt;
+use axum::extract::Path as UrlPath;
+use axum::http::HeaderMap;
 use protect_api_types::{
-    CameraMonth, Check, DiscoveryResult, EventQuery, Health, Schedule, SetupState,
+    CameraMonth, Check, ClipInfo, DiscoveryResult, EventQuery, Health, Schedule, SetupState,
     Settings, StartArchiveRequest,
 };
 use serde::Deserialize;
@@ -46,6 +49,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub docker: Option<Arc<bollard::Docker>>,
     pub jobs: archive::run::Jobs,
+    pub media: media::Media,
 }
 
 impl AppState {
@@ -177,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         docker,
         jobs: archive::run::Jobs::default(),
+        media: media::Media::new(config.state_dir.join("media")),
     };
 
     // The index syncs on a timer rather than on request. Reading the backup
@@ -210,6 +215,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws/progress", get(progress_ws))
         .route("/api/storage", get(storage_handler))
         .route("/api/storage/history", get(storage_history_handler))
+        .route("/api/media/{id}/info", get(clip_info_handler))
+        .route("/api/media/{id}/thumb", get(thumb_handler))
+        .route("/api/media/{id}/clip", get(clip_handler))
+        .route("/api/media/{id}/original", get(original_handler))
         .route("/api/upb/containers", get(containers_handler))
         .route("/api/upb/inspect", get(inspect_handler))
         .route("/ws/logs", get(logs_ws))
@@ -283,6 +292,21 @@ async fn sync_once(state: &AppState) -> anyhow::Result<upb::reconcile::SyncOutco
         outcome.cameras,
         outcome.statted
     );
+
+    // Thumbnails and transcodes only make sense for clips still on disk, so a
+    // month being archived is what makes its cache entries garbage.
+    let live: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT id FROM events WHERE status = 'live'")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let removed = state.media.evict(&live);
+    if removed > 0 {
+        tracing::info!("removed {removed} cached thumbnails/transcodes for clips no longer live");
+    }
+
     Ok(outcome)
 }
 
@@ -942,6 +966,131 @@ async fn storage_history_handler(
     match storage::history(&state.pool, q.days.clamp(1.0, 365.0)).await {
         Ok(h) => Json(h).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// Resolve an event id to a clip we are allowed to open.
+///
+/// Two checks, both necessary: the index must say the clip is live (an
+/// archived or missing clip has no file), and the path must actually be under
+/// the backup directory — it is derived from another program's data, so it is
+/// verified rather than trusted.
+async fn resolve_clip(state: &AppState, id: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT clip_path, status FROM events WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some((path, status)) = row else {
+        return Err((StatusCode::NOT_FOUND, "no such event".into()));
+    };
+    let Some(path) = path else {
+        return Err((StatusCode::NOT_FOUND, "this event was never backed up".into()));
+    };
+    if status != "live" {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("the clip is not in the live directory ({status})"),
+        ));
+    }
+
+    let path = std::path::PathBuf::from(path);
+    if !media::within(&state.config.backup_dir, &path) {
+        return Err((StatusCode::FORBIDDEN, "clip path is outside the backup directory".into()));
+    }
+    Ok(path)
+}
+
+async fn clip_info_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let path = match resolve_clip(&state, &id).await {
+        Ok(p) => p,
+        Err((_, reason)) => {
+            return Json(ClipInfo {
+                id,
+                available: false,
+                reason: Some(reason),
+                codec: None,
+                direct: false,
+                prepared: false,
+            })
+            .into_response()
+        }
+    };
+
+    let codec = state.media.probe_codec(&path).await.ok();
+    let direct = codec.as_deref().map(media::Media::browser_can_play).unwrap_or(false);
+    Json(ClipInfo {
+        prepared: direct || state.media.is_prepared(&id),
+        available: true,
+        reason: None,
+        codec,
+        direct,
+        id,
+    })
+    .into_response()
+}
+
+async fn thumb_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let source = match resolve_clip(&state, &id).await {
+        Ok(p) => p,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    match state.media.thumbnail(&id, &source).await {
+        Ok(p) => media::range::serve_file(&p, "image/jpeg", &headers).await,
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// A clip the browser can play, transcoding first if it has to.
+async fn clip_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let source = match resolve_clip(&state, &id).await {
+        Ok(p) => p,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    match state.media.playable(&id, &source).await {
+        Ok(clip) => media::range::serve_file(&clip.path, "video/mp4", &headers).await,
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// The recording itself, untouched — for downloading the real thing.
+async fn original_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    UrlPath(id): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match resolve_clip(&state, &id).await {
+        Ok(p) => media::range::serve_file(&p, "video/mp4", &headers).await,
+        Err((code, msg)) => (code, msg).into_response(),
     }
 }
 

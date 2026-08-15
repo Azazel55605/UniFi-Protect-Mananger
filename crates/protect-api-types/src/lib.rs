@@ -547,6 +547,21 @@ pub struct StorageSample {
     pub free_bytes: i64,
 }
 
+/// What playing a clip will involve, so the UI can be honest about a wait.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct ClipInfo {
+    pub id: String,
+    pub available: bool,
+    /// Why it isn't, when it isn't.
+    pub reason: Option<String>,
+    pub codec: Option<String>,
+    /// True when the browser can play the recording as-is.
+    pub direct: bool,
+    /// True when a transcode already exists, so playback starts immediately.
+    pub prepared: bool,
+}
+
 #[cfg(test)]
 mod tests {
     /// `cargo test -p protect-api-types` regenerates the TypeScript bindings;

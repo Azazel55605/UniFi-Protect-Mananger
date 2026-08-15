@@ -16,7 +16,7 @@ const groups: { label: string; items: NavItem[] }[] = [
     items: [
       { to: "/", label: "Overview", ready: true },
       { to: "/events", label: "Events", ready: true },
-      { to: "/timeline", label: "Timeline", ready: false },
+      { to: "/timeline", label: "Timeline", ready: true },
     ],
   },
   {

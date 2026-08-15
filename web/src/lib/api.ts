@@ -11,6 +11,7 @@ import type {
   AuthStatus,
   CameraInfo,
   CameraMonth,
+  ClipInfo,
   Schedule,
   StartArchiveRequest,
   DiscoveryResult,
@@ -126,6 +127,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ camera, month, pinned }),
     }),
+
+  clipInfo: (id: string) =>
+    request<ClipInfo>(`/api/media/${encodeURIComponent(id)}/info`),
 
   storage: () => request<StorageSnapshot>("/api/storage"),
 
