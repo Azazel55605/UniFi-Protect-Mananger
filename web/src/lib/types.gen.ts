@@ -105,6 +105,11 @@ reason: string | null, codec: string | null, width: number | null, height: numbe
  */
 size_bytes: number | null, 
 /**
+ * Frames per second, so stepping a frame steps exactly one frame rather
+ * than an assumed fraction of a second.
+ */
+fps: number | null, 
+/**
  * True when the browser can play the recording as-is.
  */
 direct: boolean, 

@@ -92,6 +92,17 @@ export function TimelinePage() {
     }
   }, [selected]);
 
+  // Only playable clips can be stepped to; skipping to an archived one would
+  // just close the player.
+  const neighbours = useMemo(() => {
+    const playable = ordered.filter((e) => e.status === "Live");
+    const i = selected ? playable.findIndex((e) => e.id === selected.id) : -1;
+    return {
+      previous: i > 0 ? playable[i - 1] : undefined,
+      next: i >= 0 && i < playable.length - 1 ? playable[i + 1] : undefined,
+    };
+  }, [ordered, selected]);
+
   const zoomBy = (factor: number) => {
     const centre = selected
       ? selected.start + selected.duration / 2
@@ -214,7 +225,16 @@ export function TimelinePage() {
       </Panel>
 
       <div ref={playerRef}>
-        {selected && <ClipPlayer event={selected} onClose={() => setSelected(null)} />}
+        {selected && (
+          <ClipPlayer
+            event={selected}
+            onClose={() => setSelected(null)}
+            // Neighbours follow the list you are looking at, so "next" means
+            // the next one shown rather than the next in some hidden order.
+            onPrevious={neighbours.previous ? () => select(neighbours.previous!) : undefined}
+            onNext={neighbours.next ? () => select(neighbours.next!) : undefined}
+          />
+        )}
       </div>
 
       <Panel>

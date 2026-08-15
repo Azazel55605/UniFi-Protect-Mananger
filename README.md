@@ -44,6 +44,20 @@ storage on a schedule, and see whether the pipeline is actually working.
 - A timeline of any day as a strip of marks that zooms down to seconds, with
   search, sorting, thumbnails and inline playback; selecting a clip zooms the
   strip to it, and the original recording is always downloadable untouched
+- A purpose-built player: frame-accurate stepping, jump to the next or previous
+  clip of the day, playback speed, and keyboard shortcuts
+
+### Player shortcuts
+
+| Key | Does |
+|---|---|
+| `space` / `k` | Play or pause |
+| `←` / `→` | Back or forward 5s (hold `shift` for 1s) |
+| `j` / `l` | Back or forward 10s |
+| `,` / `.` | Step one frame — exact, using the clip's real frame rate |
+| `m` | Mute |
+| `f` | Fullscreen |
+| `home` / `end` | Start or end of the clip |
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 

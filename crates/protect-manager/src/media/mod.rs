@@ -63,7 +63,7 @@ impl Media {
             .args([
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,width,height",
+                "-show_entries", "stream=codec_name,width,height,r_frame_rate",
                 "-of", "csv=p=0:nk=1",
             ])
             .arg(source)
@@ -82,6 +82,7 @@ impl Media {
             codec: parts.next().unwrap_or_default().trim().to_lowercase(),
             width: parts.next().and_then(|v| v.trim().parse().ok()),
             height: parts.next().and_then(|v| v.trim().parse().ok()),
+            fps: parts.next().and_then(parse_frame_rate),
         })
     }
 
@@ -222,6 +223,14 @@ pub struct VideoInfo {
     pub codec: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    pub fps: Option<f64>,
+}
+
+/// ffprobe reports frame rate as a rational, e.g. `20/1` or `30000/1001`.
+fn parse_frame_rate(raw: &str) -> Option<f64> {
+    let (num, den) = raw.trim().split_once('/')?;
+    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+    (den > 0.0 && num > 0.0).then_some(num / den)
 }
 
 pub struct PlayableClip {
@@ -254,6 +263,17 @@ pub fn within(root: &Path, candidate: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rates_are_read_as_rationals() {
+        assert_eq!(parse_frame_rate("20/1"), Some(20.0));
+        // NTSC-style rates are not integers and must not be rounded away.
+        let ntsc = parse_frame_rate("30000/1001").unwrap();
+        assert!((ntsc - 29.97).abs() < 0.01, "{ntsc}");
+        // A stream with no frame rate reports 0/0 rather than omitting it.
+        assert_eq!(parse_frame_rate("0/0"), None);
+        assert_eq!(parse_frame_rate("nonsense"), None);
+    }
 
     #[test]
     fn browser_playability_is_decided_by_codec() {

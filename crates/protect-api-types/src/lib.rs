@@ -563,6 +563,10 @@ pub struct ClipInfo {
     /// Size of the recording itself, not of any transcode.
     #[ts(type = "number | null")]
     pub size_bytes: Option<i64>,
+    /// Frames per second, so stepping a frame steps exactly one frame rather
+    /// than an assumed fraction of a second.
+    #[ts(type = "number | null")]
+    pub fps: Option<f64>,
     /// True when the browser can play the recording as-is.
     pub direct: bool,
     /// True when a transcode already exists, so playback starts immediately.

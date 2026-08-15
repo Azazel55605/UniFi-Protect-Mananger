@@ -1022,6 +1022,7 @@ async fn clip_info_handler(
                 width: None,
                 height: None,
                 size_bytes: None,
+                fps: None,
                 direct: false,
                 prepared: false,
             })
@@ -1044,6 +1045,7 @@ async fn clip_info_handler(
         width: probed.as_ref().and_then(|p| p.width),
         height: probed.as_ref().and_then(|p| p.height),
         size_bytes,
+        fps: probed.as_ref().and_then(|p| p.fps),
         direct,
         id,
     })

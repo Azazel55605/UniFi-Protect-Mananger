@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { formatBytes } from "@/lib/format";
@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import type { EventRecord } from "@/lib/types.gen";
 import { formatDuration } from "./TimelinePage";
+import { VideoPlayer } from "./VideoPlayer";
 
 /**
  * Inline playback, with the detail you'd otherwise have to go to the
@@ -19,11 +20,14 @@ import { formatDuration } from "./TimelinePage";
 export function ClipPlayer({
   event,
   onClose,
+  onPrevious,
+  onNext,
 }: {
   event: EventRecord;
   onClose: () => void;
+  onPrevious?: () => void;
+  onNext?: () => void;
 }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
 
   const info = useQuery({
@@ -31,12 +35,7 @@ export function ClipPlayer({
     queryFn: () => api.clipInfo(event.id),
   });
 
-  // Selecting a clip should hand it the keyboard: space and arrows then work
-  // on the video rather than scrolling the page.
-  useEffect(() => {
-    setPlaying(false);
-    videoRef.current?.focus({ preventScroll: true });
-  }, [event.id]);
+  useEffect(() => setPlaying(false), [event.id]);
 
   // Once frames are on screen the conversion is plainly over, whatever the
   // cached info call said when the clip was opened.
@@ -79,17 +78,16 @@ export function ClipPlayer({
           </p>
         )}
 
-        <video
-          ref={videoRef}
-          key={event.id}
-          controls
-          autoPlay
-          preload="metadata"
-          tabIndex={0}
-          onPlaying={() => setPlaying(true)}
-          className="max-h-[60vh] w-full rounded-[3px] bg-ink-deep"
-          src={`${clipUrl}/clip`}
-        />
+        <div onPlay={() => setPlaying(true)}>
+          <VideoPlayer
+            key={event.id}
+            src={`${clipUrl}/clip`}
+            poster={`${clipUrl}/thumb`}
+            fps={info.data?.fps}
+            onPrevious={onPrevious}
+            onNext={onNext}
+          />
+        </div>
 
         <dl className="grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-4">
           <Fact label="Recorded" value={when.toLocaleString(undefined, { hourCycle: "h23" })} />
@@ -108,11 +106,15 @@ export function ClipPlayer({
             label="Video"
             value={
               info.data?.codec
-                ? `${info.data.codec}${
+                ? [
+                    info.data.codec,
                     info.data.width && info.data.height
-                      ? ` · ${info.data.width}×${info.data.height}`
-                      : ""
-                  }`
+                      ? `${info.data.width}×${info.data.height}`
+                      : null,
+                    info.data.fps ? `${Math.round(info.data.fps)} fps` : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
                 : "…"
             }
             hint={
