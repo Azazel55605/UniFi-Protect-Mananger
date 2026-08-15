@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import type { EventRecord } from "@/lib/types.gen";
 
@@ -14,8 +14,16 @@ import type { EventRecord } from "@/lib/types.gen";
 const DAY = 86_400;
 /** Half a minute across the strip is as far in as this is useful. */
 const MIN_SPAN = 30;
+/** Grab area for the window's edges, in pixels. */
+const HANDLE = 10;
 
 export type View = { start: number; end: number };
+
+type Drag =
+  | { mode: "pan"; x: number; start: number }
+  | { mode: "move"; x: number; start: number; span: number }
+  | { mode: "start"; end: number }
+  | { mode: "end"; start: number };
 
 export function DayStrip({
   events,
@@ -34,30 +42,59 @@ export function DayStrip({
 }) {
   const [hover, setHover] = useState<EventRecord | null>(null);
   const stripRef = useRef<HTMLDivElement>(null);
-  const drag = useRef<{ x: number; start: number } | null>(null);
+  const overviewRef = useRef<HTMLDivElement>(null);
+  const drag = useRef<Drag | null>(null);
 
   const dayEnd = dayStart + DAY;
   const span = view.end - view.start;
   const zoomed = span < DAY - 1;
 
-  const clamp = (v: View): View => {
-    const width = Math.min(DAY, Math.max(MIN_SPAN, v.end - v.start));
-    let start = Math.max(dayStart, Math.min(v.start, dayEnd - width));
-    return { start, end: start + width };
+  /// Pointer capture keeps a drag alive when the cursor leaves the element,
+  /// but throws if the pointer is already gone — which must not take the
+  /// whole gesture down with it.
+  const capture = (e: React.PointerEvent<HTMLDivElement>) => {
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* the drag still works, it just stops at the element's edge */
+    }
   };
 
-  /** Zoom about a fixed point, so whatever is under the cursor stays there. */
-  const zoomAt = (factor: number, atSeconds: number) => {
-    const width = Math.min(DAY, Math.max(MIN_SPAN, span * factor));
-    const ratio = (atSeconds - view.start) / span;
-    onViewChange(clamp({ start: atSeconds - ratio * width, end: atSeconds - ratio * width + width }));
-  };
+  const clamp = useCallback(
+    (v: View): View => {
+      const width = Math.min(DAY, Math.max(MIN_SPAN, v.end - v.start));
+      const start = Math.max(dayStart, Math.min(v.start, dayEnd - width));
+      return { start, end: start + width };
+    },
+    [dayStart, dayEnd],
+  );
 
-  const timeAt = (clientX: number) => {
-    const rect = stripRef.current?.getBoundingClientRect();
-    if (!rect) return view.start;
-    return view.start + ((clientX - rect.left) / rect.width) * span;
-  };
+  // The wheel handler is attached natively rather than through React, because
+  // React registers wheel listeners as passive — `preventDefault` inside an
+  // `onWheel` prop does nothing, and the page scrolls away underneath you
+  // while you zoom. Kept in a ref so the listener always sees the current view
+  // without being torn down and rebuilt on every change.
+  const wheelState = useRef({ view, span, clamp, onViewChange });
+  wheelState.current = { view, span, clamp, onViewChange };
+
+  useEffect(() => {
+    const el = stripRef.current;
+    if (!el) return;
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const { view, span, clamp, onViewChange } = wheelState.current;
+      const rect = el.getBoundingClientRect();
+      const at = view.start + ((e.clientX - rect.left) / rect.width) * span;
+      const factor = e.deltaY > 0 ? 1.25 : 0.8;
+      const width = Math.min(DAY, Math.max(MIN_SPAN, span * factor));
+      const ratio = (at - view.start) / span;
+      onViewChange(clamp({ start: at - ratio * width, end: at - ratio * width + width }));
+    };
+
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
 
   const marks = useMemo(
     () =>
@@ -73,29 +110,81 @@ export function DayStrip({
     [events, view.start, span],
   );
 
+  const timeInOverview = (clientX: number) => {
+    const rect = overviewRef.current?.getBoundingClientRect();
+    if (!rect) return dayStart;
+    return dayStart + ((clientX - rect.left) / rect.width) * DAY;
+  };
+
+  const onOverviewDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const pxPerSecond = rect.width / DAY;
+    const leftPx = rect.left + (view.start - dayStart) * pxPerSecond;
+    const rightPx = rect.left + (view.end - dayStart) * pxPerSecond;
+
+    capture(e);
+
+    // Edges take priority over the body, so a narrow window is still
+    // resizable rather than only movable.
+    if (Math.abs(e.clientX - leftPx) <= HANDLE) {
+      drag.current = { mode: "start", end: view.end };
+    } else if (Math.abs(e.clientX - rightPx) <= HANDLE) {
+      drag.current = { mode: "end", start: view.start };
+    } else if (e.clientX > leftPx && e.clientX < rightPx) {
+      drag.current = { mode: "move", x: e.clientX, start: view.start, span };
+    } else {
+      // Outside the window: jump there, then keep dragging it around, so a
+      // click and a drag are the same gesture rather than two behaviours.
+      const at = timeInOverview(e.clientX);
+      const next = clamp({ start: at - span / 2, end: at + span / 2 });
+      onViewChange(next);
+      drag.current = { mode: "move", x: e.clientX, start: next.start, span };
+    }
+  };
+
+  const onOverviewMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = drag.current;
+    if (!d) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const secondsPerPx = DAY / rect.width;
+
+    if (d.mode === "move") {
+      const shift = (e.clientX - d.x) * secondsPerPx;
+      onViewChange(clamp({ start: d.start + shift, end: d.start + shift + d.span }));
+    } else if (d.mode === "start") {
+      const at = Math.min(timeInOverview(e.clientX), d.end - MIN_SPAN);
+      onViewChange(clamp({ start: Math.max(dayStart, at), end: d.end }));
+    } else if (d.mode === "end") {
+      const at = Math.max(timeInOverview(e.clientX), d.start + MIN_SPAN);
+      onViewChange(clamp({ start: d.start, end: Math.min(dayEnd, at) }));
+    }
+  };
+
+  const endDrag = () => {
+    drag.current = null;
+  };
+
   return (
     <div>
       {/* Detail strip */}
       <div
         ref={stripRef}
-        onWheel={(e) => {
-          e.preventDefault();
-          zoomAt(e.deltaY > 0 ? 1.25 : 0.8, timeAt(e.clientX));
-        }}
         onPointerDown={(e) => {
-          drag.current = { x: e.clientX, start: view.start };
-          e.currentTarget.setPointerCapture(e.pointerId);
+          if (!zoomed) return;
+          drag.current = { mode: "pan", x: e.clientX, start: view.start };
+          capture(e);
         }}
         onPointerMove={(e) => {
-          if (!drag.current) return;
+          const d = drag.current;
+          if (d?.mode !== "pan") return;
           const rect = stripRef.current?.getBoundingClientRect();
           if (!rect) return;
-          const shift = ((e.clientX - drag.current.x) / rect.width) * span;
-          onViewChange(clamp({ start: drag.current.start - shift, end: drag.current.start - shift + span }));
+          const shift = ((e.clientX - d.x) / rect.width) * span;
+          onViewChange(clamp({ start: d.start - shift, end: d.start - shift + span }));
         }}
-        onPointerUp={() => (drag.current = null)}
+        onPointerUp={endDrag}
         onPointerLeave={() => {
-          drag.current = null;
+          endDrag();
           setHover(null);
         }}
         className={cn(
@@ -139,35 +228,41 @@ export function DayStrip({
         })}
       </div>
 
-      {/* Overview: the whole day, with the current window marked. Only worth
-          showing once zoomed — at full extent it would duplicate the strip. */}
+      {/* Overview: the whole day, with the current window draggable by its
+          middle and resizable by either edge. Only shown once zoomed — at full
+          extent it would just duplicate the strip above. */}
       {zoomed && (
         <div
-          className="relative mt-1.5 h-6 w-full cursor-pointer overflow-hidden rounded-[2px] bg-ink-deep/60"
-          onPointerDown={(e) => {
-            const rect = e.currentTarget.getBoundingClientRect();
-            const at = dayStart + ((e.clientX - rect.left) / rect.width) * DAY;
-            onViewChange(clamp({ start: at - span / 2, end: at + span / 2 }));
-          }}
-          title="Click to jump"
+          ref={overviewRef}
+          onPointerDown={onOverviewDown}
+          onPointerMove={onOverviewMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          className="relative mt-1.5 h-7 w-full touch-none overflow-hidden rounded-[2px] bg-ink-deep/60"
+          title="Drag the window to move it, or its edges to resize"
         >
           {events.map((e) => (
             <div
               key={e.id}
               className={cn(
-                "absolute top-1.5 bottom-1.5 w-0.5 rounded-[1px]",
+                "absolute top-2 bottom-2 w-0.5 rounded-[1px]",
                 selected?.id === e.id ? "bg-signal" : "bg-live/40",
               )}
               style={{ left: `${((e.start - dayStart) / DAY) * 100}%` }}
             />
           ))}
+
           <div
-            className="absolute top-0 bottom-0 border-x border-signal bg-signal/15"
+            className="absolute top-0 bottom-0 cursor-grab bg-signal/15 active:cursor-grabbing"
             style={{
               left: `${((view.start - dayStart) / DAY) * 100}%`,
               width: `${(span / DAY) * 100}%`,
             }}
           />
+          {/* Handles are drawn outside the window box so a very narrow window
+              still presents something grabbable. */}
+          <Handle x={((view.start - dayStart) / DAY) * 100} />
+          <Handle x={((view.end - dayStart) / DAY) * 100} />
         </div>
       )}
 
@@ -183,11 +278,20 @@ export function DayStrip({
                 hover.subtypes.join(", ") || hover.event_type
               } · ${Math.round(hover.duration)}s`
             : zoomed
-              ? "drag to pan · scroll to zoom"
+              ? "drag to pan · scroll to zoom · drag the window below to move or resize"
               : "scroll to zoom in"}
         </span>
       </div>
     </div>
+  );
+}
+
+function Handle({ x }: { x: number }) {
+  return (
+    <div
+      className="absolute top-0 bottom-0 w-1.5 -translate-x-1/2 cursor-ew-resize bg-signal"
+      style={{ left: `${x}%` }}
+    />
   );
 }
 
