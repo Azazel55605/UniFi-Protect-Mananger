@@ -14,7 +14,7 @@ const groups: { label: string; items: NavItem[] }[] = [
     label: "Footage",
     items: [
       { to: "/", label: "Overview", ready: true },
-      { to: "/events", label: "Events", ready: false },
+      { to: "/events", label: "Events", ready: true },
       { to: "/timeline", label: "Timeline", ready: false },
     ],
   },
@@ -69,7 +69,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     groups.flatMap((g) => g.items).find((i) => i.to === location.pathname)?.label ?? "";
 
   return (
-    <div className="flex min-h-screen">
+    <div className="flex h-screen overflow-hidden">
       <nav className="glass-chrome flex w-56 flex-none flex-col border-r border-line">
         <div className="flex items-center gap-2.5 border-b border-line px-4 py-4">
           <span className="tally bg-signal" aria-hidden />
@@ -118,15 +118,15 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </nav>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="glass-chrome sticky top-0 z-10 flex h-14 flex-none items-center justify-between border-b border-line px-6">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <header className="glass-chrome flex h-14 flex-none items-center justify-between border-b border-line px-6">
           <h1 className="text-sm font-semibold tracking-[0.08em] uppercase">{title}</h1>
           <div className="flex items-center gap-5">
             <StatusStrip />
             <ThemeSwitch />
           </div>
         </header>
-        <main className="min-w-0 flex-1 p-6">{children}</main>
+        <main className="min-w-0 flex-1 overflow-y-auto p-6">{children}</main>
       </div>
     </div>
   );

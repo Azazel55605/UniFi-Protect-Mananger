@@ -10,8 +10,10 @@ mod auth;
 mod config;
 mod db;
 mod docker;
+mod events;
 mod health;
 mod setup;
+mod upb;
 
 use std::sync::Arc;
 
@@ -23,7 +25,9 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use futures_util::StreamExt;
-use protect_api_types::{Check, DiscoveryResult, Health, SetupState, Settings};
+use protect_api_types::{
+    Check, DiscoveryResult, EventQuery, Health, SetupState, Settings,
+};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
@@ -153,6 +157,11 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState { config: config.clone(), pool, docker };
 
+    // The index syncs on a timer rather than on request. Reading the backup
+    // service's database can block briefly while it writes, which is fine on a
+    // background task and not fine while someone waits for a page.
+    tokio::spawn(sync_loop(state.clone()));
+
     let static_dir = config.static_dir.clone();
     let index = ServeFile::new(static_dir.join("index.html"));
 
@@ -164,6 +173,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/setup", get(setup_state_handler))
         .route("/api/setup/discover", get(discover_handler))
         .route("/api/settings", put(save_settings_handler))
+        .route("/api/events", get(events_handler))
+        .route("/api/cameras", get(cameras_handler))
+        .route("/api/index/stats", get(index_stats_handler))
+        .route("/api/index/sync", post(sync_now_handler))
         .route("/api/upb/containers", get(containers_handler))
         .route("/api/upb/inspect", get(inspect_handler))
         .route("/ws/logs", get(logs_ws))
@@ -179,6 +192,65 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Periodically rebuild the event index.
+///
+/// Errors are recorded and retried rather than escalated: the backup service
+/// may be mid-write, the mount may be briefly unavailable, or setup may not
+/// have happened yet. In all of those cases the previous index stays queryable
+/// and the reason is visible in the UI.
+async fn sync_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        if let Err(e) = sync_once(&state).await {
+            // Debug level: before setup is finished this is expected on every
+            // tick, and a log full of it would bury real problems.
+            tracing::debug!("index sync skipped: {e}");
+            db::record_sync_error(&state.pool, &e.to_string()).await;
+        }
+    }
+}
+
+async fn sync_once(state: &AppState) -> anyhow::Result<upb::reconcile::SyncOutcome> {
+    let settings = db::load_settings(&state.pool).await?;
+    if !settings.setup_complete {
+        anyhow::bail!("setup is not complete");
+    }
+
+    // How far back the backup service still backfills gaps decides whether an
+    // un-captured event is recoverable or permanently lost. Read it from the
+    // container rather than assuming a value.
+    let missing_range = match state.docker.as_ref() {
+        Some(docker) => match current_container(state, docker).await {
+            Ok(Some(c)) => docker::inspect(docker, c, &state.config.backup_dir)
+                .await
+                .ok()
+                .and_then(|i| i.missing_range)
+                .and_then(|m| upb::reconcile::parse_duration_secs(&m)),
+            _ => None,
+        },
+        None => None,
+    };
+
+    let outcome = upb::reconcile::sync(
+        &state.pool,
+        &settings,
+        &state.config.backup_dir,
+        missing_range,
+    )
+    .await?;
+
+    tracing::debug!(
+        "indexed {} events across {} cameras ({} clips checked on disk)",
+        outcome.events,
+        outcome.cameras,
+        outcome.statted
+    );
+    Ok(outcome)
 }
 
 async fn shutdown_signal() {
@@ -446,6 +518,17 @@ async fn save_settings_handler(
 
     match db::save_settings(&state.pool, &body).await {
         Ok(_) => {
+            // Index immediately so the app has data the moment setup finishes,
+            // rather than an empty feed until the next tick.
+            if body.setup_complete {
+                let bg = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = sync_once(&bg).await {
+                        tracing::warn!("first index sync after setup failed: {e}");
+                        db::record_sync_error(&bg.pool, &e.to_string()).await;
+                    }
+                });
+            }
             let checks = setup::validate(&body, &state.config.backup_dir);
             Json(SetupState {
                 complete: body.setup_complete && checks.iter().all(|c| c.ok),
@@ -485,6 +568,60 @@ async fn inspect_handler(State(state): State<AppState>, jar: CookieJar) -> Respo
         },
         Ok(None) => (StatusCode::NOT_FOUND, "no backup container found").into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
+    }
+}
+
+async fn events_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(q): Query<EventQuery>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match events::query(&state.pool, &q).await {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn cameras_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match events::cameras(&state.pool).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn index_stats_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let stats = match events::stats(&state.pool).await {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    let types = events::event_types(&state.pool).await.unwrap_or_default();
+    Json(serde_json::json!({ "stats": stats, "event_types": types })).into_response()
+}
+
+/// Force a sync now, so finishing setup shows results immediately instead of
+/// leaving an empty page until the next tick.
+async fn sync_now_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match sync_once(&state).await {
+        Ok(o) => Json(serde_json::json!({
+            "events": o.events, "cameras": o.cameras, "clips_checked": o.statted
+        }))
+        .into_response(),
+        Err(e) => {
+            db::record_sync_error(&state.pool, &e.to_string()).await;
+            (StatusCode::CONFLICT, format!("{e}")).into_response()
+        }
     }
 }
 

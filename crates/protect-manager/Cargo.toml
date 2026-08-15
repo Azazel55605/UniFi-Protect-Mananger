@@ -3,6 +3,7 @@ name = "protect-manager"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Management layer for a unifi-protect-backup deployment"
 
 [dependencies]

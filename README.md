@@ -22,6 +22,13 @@ storage on a schedule, and see whether the pipeline is actually working.
   and a warning if the backup service's retention is shorter than your live
   window — which would delete footage before it is ever archived
 - Live container logs streamed over an authenticated WebSocket
+- An event index rebuilt on a timer from the backup service's own database,
+  with camera names and detection types recovered from clip paths — neither is
+  stored upstream
+- Every clip classified as available, archived, missing, awaiting backfill or
+  never captured, so a gap in the footage is visible rather than silent
+- Backup lag on the dashboard: time since the newest event that produced a
+  clip, which catches a backup service that is running but no longer capturing
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 
@@ -72,7 +79,7 @@ than showing an empty list.
 | | | |
 |---|---|---|
 | ✅ | **Shell, setup and health** | Login, interactive setup, health checks, live container logs |
-| ⬜ | **Event feed** | Read the backup service's event database, parse detection types out of clip filenames, filter by camera and type |
+| ✅ | **Event feed** | Indexes the backup service's event database, reads camera names and detection types out of clip filenames, filters by camera, type, detection and clip state |
 | ⬜ | **Archiving** | Pack old clips into per-camera monthly archives, verify them before deleting sources, run on a schedule, browse and restore archives |
 | ⬜ | **Capacity dashboard** | Pool usage, growth over time, live vs archived split |
 | ⬜ | **Timeline and playback** | Scrubbable timeline with thumbnails; clips are HEVC, so playback transcodes on demand |
@@ -109,6 +116,10 @@ deploying this for the first time should not require hand-editing config.
 | `PUT /api/settings` | Save settings; rejects a configuration that fails validation |
 | `GET /api/upb/containers` | Containers matching the backup image |
 | `GET /api/upb/inspect` | Container detail and derived configuration |
+| `GET /api/events` | Query the index: `camera_id`, `event_type`, `subtype`, `status`, `from`, `to`, `limit`, `offset` |
+| `GET /api/cameras` | Known cameras with event counts |
+| `GET /api/index/stats` | Index totals, clip states, backup lag, available filters |
+| `POST /api/index/sync` | Rebuild the index now instead of waiting for the timer |
 | `GET /ws/logs?tail=N` | Live container logs (WebSocket) |
 
 ## Subcommands
@@ -155,6 +166,14 @@ A few decisions that are easy to mistake for accidents:
 - **Settings are re-validated on every request** rather than trusting what was
   saved. Mounts vanish and permissions change; storing "validated: true" would
   make the app confidently wrong.
+- **The event index is read whole and rewritten, not merged.** The upstream
+  schema has no index on time, so reading "only what's new" scans the same
+  rows anyway — and backup rows are written *after* their event, so a
+  high-water mark would permanently miss clips that arrived late.
+- **The upstream database is only ever opened read-only, and never on the
+  request path.** It uses a rollback journal, so a reader can block while it
+  writes; that is fine on a background timer and not fine while someone waits
+  for a page.
 
 ## Licence
 

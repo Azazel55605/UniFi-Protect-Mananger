@@ -7,8 +7,12 @@
  */
 import type {
   AuthStatus,
+  CameraInfo,
   DiscoveryResult,
+  EventPage,
+  EventQuery,
   Health,
+  IndexStats,
   NamedCheck,
   Settings,
   SetupState,
@@ -74,6 +78,25 @@ export const api = {
     }),
 
   inspect: () => request<UpbInspection>("/api/upb/inspect"),
+
+  events: (q: EventQuery) => {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(q)) {
+      if (v !== undefined && v !== null && v !== "") params.set(k, String(v));
+    }
+    return request<EventPage>(`/api/events?${params}`);
+  },
+
+  cameras: () => request<CameraInfo[]>("/api/cameras"),
+
+  indexStats: () =>
+    request<{ stats: IndexStats; event_types: string[] }>("/api/index/stats"),
+
+  syncIndex: () =>
+    request<{ events: number; cameras: number; clips_checked: number }>(
+      "/api/index/sync",
+      { method: "POST" },
+    ),
 
   /** Live container logs. Authenticated by the page cookie, same origin. */
   logSocket: (tail = 200) => {

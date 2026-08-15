@@ -24,11 +24,61 @@ date_dirs: number, clip_count: number,
  */
 looks_like_camera: boolean, note: string | null, };
 
+export type CameraInfo = { camera_id: string, 
+/**
+ * Name derived from the clip path.
+ */
+derived_name: string | null, 
+/**
+ * What to show. Falls back to the derived name, then the raw id.
+ */
+display_name: string, event_count: number, 
+/**
+ * Unix seconds of the most recent event, if any.
+ */
+last_event: number | null, };
+
 export type Check = { ok: boolean, detail: string, };
+
+/**
+ * Where a clip's bytes are, which is not the same as whether an event exists.
+ */
+export type ClipStatus = "Live" | "Archived" | "Vanished" | "PendingBackfill" | "NeverBackedUp";
 
 export type ContainerRef = { id: string, name: string, image: string, state: string | null, };
 
 export type DiscoveryResult = { containers: Array<ContainerRef>, inspection: UpbInspection | null, cameras: Array<CameraCandidate>, notes: Array<string>, };
+
+export type EventPage = { events: Array<EventRecord>, 
+/**
+ * Total matching the filter, for pagination.
+ */
+total: number, offset: number, limit: number, };
+
+export type EventQuery = { camera_id?: string, event_type?: string, subtype?: string, status?: ClipStatus, from?: number, to?: number, limit?: number | null, offset?: number | null, };
+
+export type EventRecord = { id: string, camera_id: string, 
+/**
+ * Resolved display name, falling back to the raw id when unknown.
+ */
+camera: string, 
+/**
+ * The backup service's own event type, e.g. `smartDetectZone`.
+ */
+event_type: string, 
+/**
+ * Detection types, which live in the clip's filename rather than the
+ * database, and can be multiple for one event.
+ */
+subtypes: Array<string>, 
+/**
+ * Unix seconds.
+ */
+start: number, end: number, duration: number, status: ClipStatus, 
+/**
+ * Path as this container would open it. Absent when never backed up.
+ */
+clip_path: string | null, size_bytes: number, };
 
 export type Health = { ok: boolean, docker: Check, container: Check, backup_dir: Check, 
 /**
@@ -40,6 +90,20 @@ warnings: Array<string>,
  * separate so the warning list stays meaningful when it is non-empty.
  */
 info: Array<string>, };
+
+/**
+ * Health of the index itself, and of the backup pipeline feeding it.
+ */
+export type IndexStats = { total_events: number, live_clips: number, archived: number, vanished: number, pending_backfill: number, never_backed_up: number, 
+/**
+ * Seconds since the newest event that has a clip — the single best
+ * "is the pipeline working" signal, and free to compute.
+ */
+backup_lag_secs: number | null, newest_event: number | null, oldest_event: number | null, 
+/**
+ * When the index last synced, and whether that attempt worked.
+ */
+last_sync: number | null, last_sync_error: string | null, distinct_subtypes: Array<string>, };
 
 export type LoginRequest = { password: string, };
 
@@ -95,7 +159,7 @@ complete: boolean,
  */
 checks: Array<NamedCheck>, };
 
-export type UpbInspection = { container: ContainerRef, running: boolean, started_at: string | null, restart_count: bigint, 
+export type UpbInspection = { container: ContainerRef, running: boolean, started_at: string | null, restart_count: number, 
 /**
  * Docker health is unavailable when the container disables its
  * healthcheck, which the backup service's image does by default.

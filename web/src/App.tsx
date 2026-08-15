@@ -6,6 +6,7 @@ import { AppShell } from "@/components/AppShell";
 import { LoginPage } from "@/features/auth/LoginPage";
 import { SetupWizard } from "@/features/setup/SetupWizard";
 import { OverviewPage } from "@/features/overview/OverviewPage";
+import { EventsPage } from "@/features/events/EventsPage";
 import { LogsPage } from "@/features/logs/LogsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { Placeholder } from "@/features/placeholder";
@@ -61,16 +62,7 @@ export function App() {
       <AppShell>
         <Routes>
           <Route path="/" element={<OverviewPage />} />
-          <Route
-            path="/events"
-            element={
-              <Placeholder
-                title="Event feed"
-                description="Motion and smart-detect events from every camera, filterable by camera and detection type."
-                waitingOn="the event index"
-              />
-            }
-          />
+          <Route path="/events" element={<EventsPage />} />
           <Route
             path="/timeline"
             element={

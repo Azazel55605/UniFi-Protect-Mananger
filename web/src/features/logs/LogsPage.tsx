@@ -37,7 +37,7 @@ export function LogsPage() {
   }, [lines]);
 
   return (
-    <Panel className="flex h-[calc(100vh-7.5rem)] flex-col">
+    <Panel className="flex h-full flex-col">
       <PanelHeader
         label="Backup service output"
         aside={

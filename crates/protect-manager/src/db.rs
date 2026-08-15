@@ -57,7 +57,75 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
 
+    // The event index. This is a derived copy of the backup service's data,
+    // enriched with everything it doesn't store: camera names, detection
+    // subtypes, clip presence and size. Safe to drop and rebuild at any time.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS events (
+            id          TEXT PRIMARY KEY,
+            camera_id   TEXT NOT NULL,
+            camera_name TEXT,
+            event_type  TEXT NOT NULL,
+            subtypes    TEXT NOT NULL DEFAULT '',
+            start       REAL NOT NULL,
+            end         REAL NOT NULL,
+            duration    REAL NOT NULL,
+            status      TEXT NOT NULL,
+            clip_path   TEXT,
+            size_bytes  INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // The upstream database has no index at all, which is why time-range
+    // queries there scan the table. Ours does not have that excuse.
+    for stmt in [
+        "CREATE INDEX IF NOT EXISTS events_start ON events (start DESC)",
+        "CREATE INDEX IF NOT EXISTS events_camera_start ON events (camera_id, start DESC)",
+        "CREATE INDEX IF NOT EXISTS events_type_start ON events (event_type, start DESC)",
+        "CREATE INDEX IF NOT EXISTS events_status ON events (status)",
+    ] {
+        sqlx::query(stmt).execute(pool).await?;
+    }
+
+    // Camera identity is derived from clip paths, but a display name the user
+    // chose is theirs — kept in a separate column so a resync cannot erase it.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cameras (
+            camera_id    TEXT PRIMARY KEY,
+            derived_name TEXT,
+            display_name TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS index_state (
+            id         INTEGER PRIMARY KEY CHECK (id = 1),
+            last_sync  REAL,
+            last_error TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
+}
+
+/// Record a failed sync without disturbing the index it failed to replace.
+///
+/// A stale index plus a visible error is more useful than an empty one: the
+/// events you could see a minute ago are still true.
+pub async fn record_sync_error(pool: &SqlitePool, message: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO index_state (id, last_error) VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET last_error = excluded.last_error",
+    )
+    .bind(message)
+    .execute(pool)
+    .await;
 }
 
 fn now() -> i64 {

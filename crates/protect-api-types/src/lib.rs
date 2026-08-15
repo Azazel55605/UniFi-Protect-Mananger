@@ -10,6 +10,10 @@ use ts_rs::TS;
 
 const OUT: &str = "../../../web/src/lib/types.gen.ts";
 
+// Note: `i64`/`usize` fields carry `#[ts(type = "number")]`. ts-rs would
+// otherwise generate `bigint`, but `serde_json` writes them as ordinary JSON
+// numbers — the annotation keeps the generated type honest about the wire.
+
 // ---------------------------------------------------------------- auth
 
 #[derive(Debug, Serialize, Deserialize, TS)]
@@ -91,6 +95,7 @@ pub struct UpbInspection {
     pub container: ContainerRef,
     pub running: bool,
     pub started_at: Option<String>,
+    #[ts(type = "number")]
     pub restart_count: i64,
     /// Docker health is unavailable when the container disables its
     /// healthcheck, which the backup service's image does by default.
@@ -99,6 +104,7 @@ pub struct UpbInspection {
     /// Only an allowlist is read; the container's environment holds NVR
     /// credentials in plaintext.
     pub env: Vec<(String, String)>,
+    #[ts(type = "number")]
     pub env_withheld: usize,
     pub command: Option<String>,
     pub retention: Option<String>,
@@ -167,6 +173,128 @@ pub struct DiscoveryResult {
     pub inspection: Option<UpbInspection>,
     pub cameras: Vec<CameraCandidate>,
     pub notes: Vec<String>,
+}
+
+// --------------------------------------------------------------- events
+
+/// Where a clip's bytes are, which is not the same as whether an event exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub enum ClipStatus {
+    /// The file is on disk and playable.
+    Live,
+    /// Backed up once, but no longer in the live directory — it has aged out
+    /// and been archived. The archive that holds it is named once archiving
+    /// is implemented.
+    Archived,
+    /// Backed up, still inside the live window, but the file is not there.
+    /// Something removed it out of band; worth surfacing rather than hiding.
+    Vanished,
+    /// The event was recorded but never backed up, and still could be — the
+    /// backup service backfills gaps within a window.
+    PendingBackfill,
+    /// Never backed up and now outside that window. The footage is gone.
+    NeverBackedUp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct EventRecord {
+    pub id: String,
+    pub camera_id: String,
+    /// Resolved display name, falling back to the raw id when unknown.
+    pub camera: String,
+    /// The backup service's own event type, e.g. `smartDetectZone`.
+    pub event_type: String,
+    /// Detection types, which live in the clip's filename rather than the
+    /// database, and can be multiple for one event.
+    pub subtypes: Vec<String>,
+    /// Unix seconds.
+    pub start: f64,
+    pub end: f64,
+    pub duration: f64,
+    pub status: ClipStatus,
+    /// Path as this container would open it. Absent when never backed up.
+    pub clip_path: Option<String>,
+    #[ts(type = "number")]
+    pub size_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct EventPage {
+    pub events: Vec<EventRecord>,
+    /// Total matching the filter, for pagination.
+    #[ts(type = "number")]
+    pub total: i64,
+    #[ts(type = "number")]
+    pub offset: i64,
+    #[ts(type = "number")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct CameraInfo {
+    pub camera_id: String,
+    /// Name derived from the clip path.
+    pub derived_name: Option<String>,
+    /// What to show. Falls back to the derived name, then the raw id.
+    pub display_name: String,
+    #[ts(type = "number")]
+    pub event_count: i64,
+    /// Unix seconds of the most recent event, if any.
+    pub last_event: Option<f64>,
+}
+
+/// Health of the index itself, and of the backup pipeline feeding it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct IndexStats {
+    #[ts(type = "number")]
+    pub total_events: i64,
+    #[ts(type = "number")]
+    pub live_clips: i64,
+    #[ts(type = "number")]
+    pub archived: i64,
+    #[ts(type = "number")]
+    pub vanished: i64,
+    #[ts(type = "number")]
+    pub pending_backfill: i64,
+    #[ts(type = "number")]
+    pub never_backed_up: i64,
+    /// Seconds since the newest event that has a clip — the single best
+    /// "is the pipeline working" signal, and free to compute.
+    pub backup_lag_secs: Option<f64>,
+    pub newest_event: Option<f64>,
+    pub oldest_event: Option<f64>,
+    /// When the index last synced, and whether that attempt worked.
+    pub last_sync: Option<f64>,
+    pub last_sync_error: Option<String>,
+    pub distinct_subtypes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct EventQuery {
+    #[ts(optional)]
+    pub camera_id: Option<String>,
+    #[ts(optional)]
+    pub event_type: Option<String>,
+    #[ts(optional)]
+    pub subtype: Option<String>,
+    #[ts(optional)]
+    pub status: Option<ClipStatus>,
+    #[ts(optional)]
+    pub from: Option<f64>,
+    #[ts(optional)]
+    pub to: Option<f64>,
+    #[ts(optional)]
+    #[ts(type = "number | null")]
+    pub limit: Option<i64>,
+    #[ts(optional)]
+    #[ts(type = "number | null")]
+    pub offset: Option<i64>,
 }
 
 #[cfg(test)]
