@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>protect-manager</title>
+    <script>
+      // Applied before first paint. Without this the page renders in the
+      // default palette for a frame and then snaps to the stored one, which
+      // reads as a flicker every time the app is opened.
+      try {
+        var t = localStorage.getItem("pm.theme");
+        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+        document.documentElement.dataset.accent = localStorage.getItem("pm.accent") || "amber";
+      } catch (e) {
+        document.documentElement.dataset.accent = "amber";
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

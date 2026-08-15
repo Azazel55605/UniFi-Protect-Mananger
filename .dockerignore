@@ -1,0 +1,9 @@
+target/
+TEMP/
+shots/
+.git/
+.playwright-mcp/
+web/node_modules/
+web/dist/
+deploy/
+*.md

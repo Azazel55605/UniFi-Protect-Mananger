@@ -1,0 +1,296 @@
+@import "tailwindcss";
+
+@import "@fontsource-variable/archivo";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+/* Fonts are bundled, never fetched. The app runs on a private network with no
+   guarantee of internet access, and a dashboard that waits on a font CDN is a
+   dashboard that hangs exactly when you need it. */
+
+/* ---------------------------------------------------------------- accents
+
+   The accent is chosen at runtime, so it lives in a plain custom property
+   rather than a Tailwind token. `--accent-strong` is the text-safe variant:
+   on a light background the fill colors are too pale to read at small sizes,
+   so it is darkened rather than a second hand-picked hex per accent. */
+
+:root {
+  --accent: #ffb020;
+  --accent-contrast: #14100a;
+}
+[data-accent="cyan"] {
+  --accent: #22d3ee;
+  --accent-contrast: #04191d;
+}
+[data-accent="violet"] {
+  --accent: #a78bfa;
+  --accent-contrast: #140b26;
+}
+[data-accent="rose"] {
+  --accent: #fb7185;
+  --accent-contrast: #250910;
+}
+[data-accent="lime"] {
+  --accent: #a3e635;
+  --accent-contrast: #101a04;
+}
+
+/* ----------------------------------------------------------------- themes
+
+   Light is the bare `:root` default so a page with no stored preference and
+   no `data-theme` still paints a complete palette. Dark is applied both by
+   explicit choice and by system preference. */
+
+:root {
+  --ink: #eef1f5;
+  --ink-deep: #e4e9ef;
+  --panel: #ffffff;
+  --raised: #f4f6f9;
+  --line: #d9e0e8;
+  --line-bright: #b9c4d0;
+
+  --fg: #16202b;
+  --fg-dim: #4d5b6a;
+  --fg-faint: #77848f;
+
+  --good: #16a34a;
+  --bad: #dc2626;
+  --warn: #b45309;
+  --live: #0d9488;
+
+  --accent-strong: color-mix(in oklab, var(--accent) 72%, #2a1c00);
+  --glass: 82%;
+  --ambient: 0.28;
+  /* Light panels are near-white on near-white, so they need a shadow to read
+     as separate surfaces. Dark panels already separate by value and a shadow
+     there would only muddy them. */
+  --panel-shadow:
+    0 1px 2px rgb(16 32 43 / 0.05),
+    0 10px 28px -14px rgb(16 32 43 / 0.18);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: #0b0f14;
+    --ink-deep: #070a0e;
+    --panel: #121820;
+    --raised: #1a222c;
+    --line: #26303c;
+    --line-bright: #354254;
+
+    --fg: #dce3eb;
+    --fg-dim: #93a1b1;
+    --fg-faint: #6b7887;
+
+    --good: #4ade80;
+    --bad: #ff5c5c;
+    --warn: #e8a33d;
+    --live: #35d0ba;
+
+    --accent-strong: var(--accent);
+    --glass: 72%;
+    --ambient: 0.3;
+    --panel-shadow: none;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ink: #0b0f14;
+  --ink-deep: #070a0e;
+  --panel: #121820;
+  --raised: #1a222c;
+  --line: #26303c;
+  --line-bright: #354254;
+
+  --fg: #dce3eb;
+  --fg-dim: #93a1b1;
+  --fg-faint: #6b7887;
+
+  --good: #4ade80;
+  --bad: #ff5c5c;
+  --warn: #e8a33d;
+  --live: #35d0ba;
+
+  --accent-strong: var(--accent);
+  --glass: 72%;
+  --ambient: 0.3;
+  --panel-shadow: none;
+}
+
+/* `inline` so the Tailwind tokens resolve to the live custom properties
+   instead of being frozen at build time — which is what lets the theme and
+   accent change without a reload. */
+@theme inline {
+  --color-ink: var(--ink);
+  --color-ink-deep: var(--ink-deep);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-line-bright: var(--line-bright);
+
+  --color-fg: var(--fg);
+  --color-fg-dim: var(--fg-dim);
+  --color-fg-faint: var(--fg-faint);
+
+  --color-signal: var(--accent);
+  --color-signal-strong: var(--accent-strong);
+  --color-signal-contrast: var(--accent-contrast);
+
+  --color-good: var(--good);
+  --color-bad: var(--bad);
+  --color-warn: var(--warn);
+  --color-live: var(--live);
+
+  --font-sans: "Archivo Variable", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  /* Equipment panels, not app cards. */
+  --radius-panel: 3px;
+}
+
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme="light"]) {
+      color-scheme: dark;
+    }
+  }
+  html[data-theme="dark"] {
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--ink);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-synthesis-weight: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Ambient wash. Translucency only reads as translucency when there is
+     something behind it — over a flat fill, a blurred panel is just a panel.
+     Two accent-tinted pools give the frosted surfaces something to pick up,
+     and tie the chosen accent through the whole chassis rather than leaving
+     it stranded on buttons. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        60rem 40rem at 12% -10%,
+        color-mix(in oklab, var(--accent) calc(var(--ambient) * 100%), transparent),
+        transparent 70%
+      ),
+      radial-gradient(
+        50rem 36rem at 105% 8%,
+        color-mix(in oklab, var(--live) calc(var(--ambient) * 55%), transparent),
+        transparent 70%
+      );
+  }
+
+  /* Data is the interface here: paths, timecodes, counts and IDs are all set
+     in mono and aligned, so columns of numbers can be scanned, not read. */
+  .data {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.8125rem;
+    letter-spacing: -0.01em;
+  }
+
+  /* Section markers, borrowed from equipment labelling. */
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent-strong);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-contrast);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line-bright);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 6px;
+  }
+}
+
+@layer components {
+  /* Frosted surfaces. The alpha differs per theme: a light theme needs more
+     opacity to keep small text legible over the wash, a dark one can afford
+     to let more through. */
+  .glass {
+    background: color-mix(in srgb, var(--panel) var(--glass), transparent);
+    backdrop-filter: blur(14px) saturate(1.3);
+    -webkit-backdrop-filter: blur(14px) saturate(1.3);
+    box-shadow: var(--panel-shadow);
+  }
+
+  .glass-chrome {
+    background: color-mix(in srgb, var(--panel) calc(var(--glass) - 12%), transparent);
+    backdrop-filter: blur(20px) saturate(1.4);
+    -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  }
+
+  /* Long-form monospace stays fully opaque. Blurred backgrounds under dense
+     small text cost more legibility than they buy in atmosphere. */
+  .surface-solid {
+    background: var(--ink-deep);
+  }
+
+  /* The status indicator this console is built around. Square, because that
+     is what equipment status lights look like — and reusing one shape
+     everywhere means its meaning only has to be learned once. */
+  .tally {
+    width: 7px;
+    height: 7px;
+    flex: none;
+    border-radius: 1px;
+  }
+
+  .tally-live {
+    animation: tally-pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes tally-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tally-live {
+      animation: none;
+    }
+  }
+}

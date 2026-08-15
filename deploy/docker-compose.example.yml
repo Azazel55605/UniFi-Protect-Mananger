@@ -1,0 +1,49 @@
+# Example deployment. Every path here is a placeholder — supply your own.
+#
+# The container paths (/backup, /archive) are fixed and generic; you map your
+# own host directories onto them. Nothing about one user's layout is baked in.
+
+services:
+  protect-manager:
+    image: protect-manager:local
+    restart: unless-stopped
+
+    volumes:
+      # Read-only, and only this container touches it. The Docker API is
+      # root-equivalent on the host, so it is never exposed on a network port.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+      # The backup container's output root: camera directories plus the
+      # directory holding events.sqlite. Read-only until Phase 3, which is when
+      # archiving needs to delete sources — the destructive capability does not
+      # exist in the container before the phase that needs it.
+      - ${BACKUP_DIR:?path to your unifi-protect-backup output root}:/backup:ro
+
+      # Where .tar archives are written. Not used until Phase 3.
+      - ${ARCHIVE_DIR:?path to your archive directory}:/archive
+
+      - pm-state:/var/lib/protect-manager   # our database, sessions, caches
+
+    environment:
+      # Generate with: docker run --rm protect-manager:local hash-password 'your-password'
+      - PM_PASSWORD_HASH=${PM_PASSWORD_HASH:?run hash-password to generate this}
+
+      # Which container is the backup service is discovered by image, not by
+      # name — compose deployments that don't set container_name get a
+      # generated one, so any hardcoded name would be wrong elsewhere.
+      # Override only if you run a fork or a retagged image:
+      # - PM_UPB_IMAGE=ghcr.io/ep1cman/unifi-protect-backup
+
+    # The gid that owns the clip files: `stat -c %g <a-clip-file>`. Without it
+    # the app cannot read the clip directory, and /api/health will say so.
+    # Depending on your host you may also need the docker socket's group.
+    group_add:
+      - ${CLIP_GID:?gid owning the clip files}
+
+    # Bound to the reverse proxy's reach only. TLS terminates at the proxy, and
+    # the session cookie is Secure, so plain HTTP access will not stay logged in.
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8642:8642"
+
+volumes:
+  pm-state:
