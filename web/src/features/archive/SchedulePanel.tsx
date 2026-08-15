@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ErrorNotice } from "@/components/ui/notice";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import { Tally } from "@/components/ui/tally";
 import type { Schedule, ScheduleKind } from "@/lib/types.gen";
@@ -39,7 +40,7 @@ export function SchedulePanel() {
   const queryClient = useQueryClient();
   const { data } = useQuery({ queryKey: ["schedule"], queryFn: api.schedule });
   const [draft, setDraft] = useState<Schedule | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     if (data && !draft) setDraft(data);
@@ -52,7 +53,7 @@ export function SchedulePanel() {
       setError(null);
       queryClient.invalidateQueries({ queryKey: ["schedule"] });
     },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "Could not save"),
+    onError: setError,
   });
 
   if (!draft) return null;
@@ -162,7 +163,7 @@ export function SchedulePanel() {
           </p>
         </div>
 
-        {error && <p className="text-sm text-bad">{error}</p>}
+        {error != null && <ErrorNotice error={error} />}
 
         <div className="flex items-center gap-3">
           <Button variant="primary" disabled={!dirty || save.isPending} onClick={() => save.mutate(draft)}>

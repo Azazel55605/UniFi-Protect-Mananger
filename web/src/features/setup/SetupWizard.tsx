@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
+import { ErrorNotice } from "@/components/ui/notice";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,7 +20,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
   const queryClient = useQueryClient();
   const [step, setStep] = useState(0);
   const [draft, setDraft] = useState<Settings | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const existing = useQuery({ queryKey: ["setup"], queryFn: api.setup });
   const discovery = useQuery({ queryKey: ["discover"], queryFn: api.discover });
@@ -52,13 +53,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
       queryClient.invalidateQueries();
       onDone();
     },
-    onError: (e) => {
-      setError(
-        e instanceof ApiError
-          ? (e.checks?.map((c) => `${c.name}: ${c.detail}`).join(" · ") ?? e.message)
-          : "Could not save",
-      );
-    },
+    onError: setError,
   });
 
   if (!draft) {
@@ -286,7 +281,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
                   <dd className="data min-w-0 flex-1 break-all text-fg">{v || "—"}</dd>
                 </div>
               ))}
-              {error && <p className="text-sm text-bad">{error}</p>}
+              {error != null && <ErrorNotice error={error} />}
             </dl>
           )}
         </PanelBody>

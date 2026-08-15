@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { ErrorNotice } from "@/components/ui/notice";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import { Tally } from "@/components/ui/tally";
 import type {
@@ -20,7 +21,7 @@ export function ArchivePage() {
   const queryClient = useQueryClient();
   const progress = useProgress();
   const [selected, setSelected] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   const overview = useQuery({ queryKey: ["archive"], queryFn: api.archive });
   const runs = useQuery({ queryKey: ["archive-runs"], queryFn: api.archiveRuns });
@@ -37,7 +38,7 @@ export function ArchivePage() {
       setError(null);
       queryClient.invalidateQueries({ queryKey: ["archive-runs"] });
     },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "Could not start"),
+    onError: setError,
   });
 
   const due = (overview.data?.due ?? []).filter((d) => !d.blocked);
@@ -140,7 +141,7 @@ export function ArchivePage() {
             <BlockedRow key={`${d.camera}/${d.month}`} entry={d} />
           ))}
 
-          {error && <p className="text-sm text-bad">{error}</p>}
+          {error != null && <ErrorNotice error={error} />}
         </PanelBody>
       </Panel>
 
@@ -349,12 +350,12 @@ function CameraGroup({
 
 function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
   const queryClient = useQueryClient();
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [confirming, setConfirming] = useState(false);
   const target: CameraMonth = { camera: entry.camera, month: entry.month };
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["archive"] });
-  const fail = (e: unknown) => setError(e instanceof ApiError ? e.message : "Failed");
+  const fail = setError;
 
   const verify = useMutation({ mutationFn: () => api.verifyArchive(target), onError: fail });
   const restore = useMutation({
@@ -432,7 +433,7 @@ function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
           immediately archive it again.
         </p>
       )}
-      {error && <p className="mt-2 text-xs text-bad">{error}</p>}
+      {error != null && <ErrorNotice error={error} className="mt-2" />}
     </li>
   );
 }

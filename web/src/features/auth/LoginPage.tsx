@@ -1,6 +1,7 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { ErrorNotice } from "@/components/ui/notice";
 import { Input } from "@/components/ui/input";
 
 export function LoginPage({
@@ -11,9 +12,19 @@ export function LoginPage({
   onSignedIn: () => void;
 }) {
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [cookieBlocked, setCookieBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [lockedFor, setLockedFor] = useState(0);
+
+  // The server refuses until the backoff expires, so the form counts down
+  // rather than letting you retype the password into a rejection. Being told
+  // "too many attempts" with no idea how long is its own small cruelty.
+  useEffect(() => {
+    if (lockedFor <= 0) return;
+    const timer = setInterval(() => setLockedFor((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(timer);
+  }, [lockedFor]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -22,6 +33,7 @@ export function LoginPage({
     setCookieBlocked(false);
     try {
       await api.login(password);
+      setLockedFor(0);
 
       // The password was right, but that isn't the same as being signed in.
       // Over plain HTTP the browser accepts the response and then discards the
@@ -39,7 +51,10 @@ export function LoginPage({
       setPassword("");
       onSignedIn();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not reach the server");
+      setError(err);
+      if (err instanceof ApiError && err.retryAfter) {
+        setLockedFor(Math.ceil(err.retryAfter));
+      }
     } finally {
       setBusy(false);
     }
@@ -74,7 +89,7 @@ export function LoginPage({
               onChange={(e) => setPassword(e.target.value)}
             />
 
-            {error && <p className="mt-3 text-sm text-bad">{error}</p>}
+            {error != null && <ErrorNotice error={error} className="mt-3" />}
 
             {cookieBlocked && (
               <div className="mt-4 rounded-[3px] border border-warn/40 p-3">
@@ -91,8 +106,17 @@ export function LoginPage({
               </div>
             )}
 
-            <Button type="submit" variant="primary" className="mt-5 w-full" disabled={busy}>
-              {busy ? "Signing in…" : "Sign in"}
+            <Button
+              type="submit"
+              variant="primary"
+              className="mt-5 w-full"
+              disabled={busy || lockedFor > 0}
+            >
+              {lockedFor > 0
+                ? `Try again in ${lockedFor}s`
+                : busy
+                  ? "Signing in…"
+                  : "Sign in"}
             </Button>
           </form>
         ) : (

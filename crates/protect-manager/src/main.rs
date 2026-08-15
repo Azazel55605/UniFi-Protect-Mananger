@@ -11,20 +11,24 @@ mod auth;
 mod config;
 mod db;
 mod docker;
+mod error;
 mod events;
 mod health;
 mod media;
+mod ratelimit;
 mod setup;
 mod storage;
+mod trace;
 mod upb;
 mod watchdog;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::CookieJar;
@@ -38,10 +42,10 @@ use protect_api_types::{
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
-use tower_http::trace::TraceLayer;
 
 use crate::auth::authenticated;
 use crate::config::Config;
+use crate::error::ApiError;
 use crate::health::check_backup_dir;
 
 #[derive(Clone)]
@@ -51,6 +55,9 @@ pub struct AppState {
     pub docker: Option<Arc<bollard::Docker>>,
     pub jobs: archive::run::Jobs,
     pub media: media::Media,
+    /// Sign-in backoff. In memory rather than in the database: it protects
+    /// against a burst, and a process restart is not a burst.
+    pub limiter: Arc<ratelimit::Limiter>,
 }
 
 impl AppState {
@@ -183,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
         docker,
         jobs: archive::run::Jobs::default(),
         media: media::Media::new(config.state_dir.join("media")),
+        limiter: Arc::new(ratelimit::Limiter::default()),
     };
 
     // The index syncs on a timer rather than on request. Reading the backup
@@ -200,6 +208,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/status", get(auth::status))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/sessions", get(auth::sessions))
+        .route("/api/auth/sessions/revoke-others", post(auth::revoke_others))
         .route("/api/health", get(health_handler))
         .route("/api/setup", get(setup_state_handler))
         .route("/api/setup/discover", get(discover_handler))
@@ -229,14 +239,19 @@ async fn main() -> anyhow::Result<()> {
         // Client-side routing: unknown paths fall back to index.html so a deep
         // link or a refresh lands on the app rather than a 404.
         .fallback_service(ServeDir::new(&static_dir).fallback(index))
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(trace::middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!("listening on http://{}", config.bind);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Connect info so sign-in backoff can tell clients apart when there is no
+    // proxy in front to say who they are.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -430,15 +445,13 @@ async fn shutdown_signal() {
 
 /// Guard for everything that isn't the login flow itself.
 ///
-/// Returns the rejection response itself so callers can `return` it directly.
-/// `Response` is a large `Err` variant, but this never crosses a hot path and
-/// boxing it would only add indirection to every handler.
-#[allow(clippy::result_large_err)]
-async fn require_auth(state: &AppState, jar: &CookieJar) -> Result<(), Response> {
+/// Every authenticated handler opens with `require_auth(&state, &jar).await?`,
+/// which is short enough that forgetting it is visible in review.
+async fn require_auth(state: &AppState, jar: &CookieJar) -> Result<(), ApiError> {
     if authenticated(state, jar).await {
         Ok(())
     } else {
-        Err((StatusCode::UNAUTHORIZED, "authentication required").into_response())
+        Err(ApiError::unauthenticated())
     }
 }
 
@@ -487,10 +500,11 @@ pub async fn current_container(
     Ok(found)
 }
 
-async fn health_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+async fn health_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Health>, ApiError> {
+    require_auth(&state, &jar).await?;
 
     let mut warnings = Vec::new();
     let mut info = Vec::new();
@@ -599,15 +613,14 @@ async fn health_handler(State(state): State<AppState>, jar: CookieJar) -> Respon
 
     let backup = check_backup_dir(&state.config.backup_dir);
 
-    Json(Health {
+    Ok(Json(Health {
         ok: docker_check.ok && container_check.ok && backup.ok,
         docker: docker_check,
         container: container_check,
         backup_dir: backup,
         warnings,
         info,
-    })
-    .into_response()
+    }))
 }
 
 /// Parse UPB's retention argument (`36500d`, `72h`, `90m`) into whole days.
@@ -627,24 +640,25 @@ fn parse_retention_days(raw: &str) -> Option<u64> {
     }
 }
 
-async fn setup_state_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+async fn setup_state_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<SetupState>, ApiError> {
+    require_auth(&state, &jar).await?;
     let settings = db::load_settings(&state.pool).await.unwrap_or_default();
     let checks = setup::validate(&settings, &state.config.backup_dir);
-    Json(SetupState {
+    Ok(Json(SetupState {
         complete: settings.setup_complete && checks.iter().all(|c| c.ok),
         settings,
         checks,
-    })
-    .into_response()
+    }))
 }
 
-async fn discover_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+async fn discover_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<DiscoveryResult>, ApiError> {
+    require_auth(&state, &jar).await?;
 
     let mut notes = Vec::new();
     let (containers, inspection) = match state.docker.as_ref() {
@@ -680,183 +694,166 @@ async fn discover_handler(State(state): State<AppState>, jar: CookieJar) -> Resp
         notes.extend(i.proposed.notes.clone());
     }
 
-    Json(DiscoveryResult { containers, inspection, cameras, notes }).into_response()
+    Ok(Json(DiscoveryResult { containers, inspection, cameras, notes }))
 }
 
 async fn save_settings_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(mut body): Json<Settings>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+) -> Result<Json<SetupState>, ApiError> {
+    require_auth(&state, &jar).await?;
 
     // Validate before storing. Refusing to save a configuration we already know
     // is broken keeps "saved" meaning something.
     let checks = setup::validate(&body, &state.config.backup_dir);
     if body.setup_complete && !checks.iter().all(|c| c.ok) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(checks.into_iter().filter(|c| !c.ok).collect::<Vec<_>>()),
-        )
-            .into_response();
+        return Err(ApiError::invalid_settings(
+            checks.into_iter().filter(|c| !c.ok).collect(),
+        ));
     }
 
     body.camera_dirs.sort();
     body.camera_dirs.dedup();
 
-    match db::save_settings(&state.pool, &body).await {
-        Ok(_) => {
-            // Index immediately so the app has data the moment setup finishes,
-            // rather than an empty feed until the next tick.
-            if body.setup_complete {
-                let bg = state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = sync_once(&bg).await {
-                        tracing::warn!("first index sync after setup failed: {e}");
-                        db::record_sync_error(&bg.pool, &e.to_string()).await;
-                    }
-                });
+    db::save_settings(&state.pool, &body).await.map_err(ApiError::internal)?;
+
+    // Index immediately so the app has data the moment setup finishes, rather
+    // than an empty feed until the next tick.
+    if body.setup_complete {
+        let bg = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sync_once(&bg).await {
+                tracing::warn!("first index sync after setup failed: {e}");
+                db::record_sync_error(&bg.pool, &e.to_string()).await;
             }
-            let checks = setup::validate(&body, &state.config.backup_dir);
-            Json(SetupState {
-                complete: body.setup_complete && checks.iter().all(|c| c.ok),
-                settings: body,
-                checks,
-            })
-            .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        });
     }
+
+    let checks = setup::validate(&body, &state.config.backup_dir);
+    Ok(Json(SetupState {
+        complete: body.setup_complete && checks.iter().all(|c| c.ok),
+        settings: body,
+        checks,
+    }))
 }
 
-async fn containers_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let Some(docker) = state.docker.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "docker unavailable").into_response();
-    };
-    match docker::discover(docker, &state.config.upb_image).await {
-        Ok(list) => Json(list).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
-    }
+async fn containers_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<protect_api_types::ContainerRef>>, ApiError> {
+    require_auth(&state, &jar).await?;
+    let docker = state.docker.as_ref().ok_or_else(ApiError::docker_unavailable)?;
+    docker::discover(docker, &state.config.upb_image)
+        .await
+        .map(Json)
+        .map_err(ApiError::docker_failed)
 }
 
-async fn inspect_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let Some(docker) = state.docker.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "docker unavailable").into_response();
-    };
-    match current_container(&state, docker).await {
-        Ok(Some(c)) => match docker::inspect(docker, c, &state.config.backup_dir).await {
-            Ok(i) => Json(i).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
-        },
-        Ok(None) => (StatusCode::NOT_FOUND, "no backup container found").into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
-    }
+async fn inspect_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<protect_api_types::UpbInspection>, ApiError> {
+    require_auth(&state, &jar).await?;
+    let docker = state.docker.as_ref().ok_or_else(ApiError::docker_unavailable)?;
+
+    let container = current_container(&state, docker)
+        .await
+        .map_err(ApiError::docker_failed)?
+        .ok_or_else(|| ApiError::container_not_found(&state.config.upb_image))?;
+
+    docker::inspect(docker, container, &state.config.backup_dir)
+        .await
+        .map(Json)
+        .map_err(ApiError::docker_failed)
 }
 
 async fn events_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(q): Query<EventQuery>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match events::query(&state.pool, &q).await {
-        Ok(page) => Json(page).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+) -> Result<Json<protect_api_types::EventPage>, ApiError> {
+    require_auth(&state, &jar).await?;
+    Ok(Json(events::query(&state.pool, &q).await?))
 }
 
-async fn cameras_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match events::cameras(&state.pool).await {
-        Ok(list) => Json(list).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+async fn cameras_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<protect_api_types::CameraInfo>>, ApiError> {
+    require_auth(&state, &jar).await?;
+    Ok(Json(events::cameras(&state.pool).await?))
 }
 
-async fn index_stats_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let stats = match events::stats(&state.pool).await {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    };
+async fn index_stats_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&state, &jar).await?;
+    let stats = events::stats(&state.pool).await?;
     let types = events::event_types(&state.pool).await.unwrap_or_default();
-    Json(serde_json::json!({ "stats": stats, "event_types": types })).into_response()
+    Ok(Json(serde_json::json!({ "stats": stats, "event_types": types })))
 }
 
 /// Force a sync now, so finishing setup shows results immediately instead of
 /// leaving an empty page until the next tick.
-async fn sync_now_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+async fn sync_now_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&state, &jar).await?;
     match sync_once(&state).await {
-        Ok(o) => Json(serde_json::json!({
+        Ok(o) => Ok(Json(serde_json::json!({
             "events": o.events, "cameras": o.cameras, "clips_checked": o.statted
-        }))
-        .into_response(),
+        }))),
         Err(e) => {
             db::record_sync_error(&state.pool, &e.to_string()).await;
-            (StatusCode::CONFLICT, format!("{e}")).into_response()
+            // A sync that cannot run is almost always "setup is unfinished" or
+            // "the mount went away" — the user's to fix, not a server fault.
+            Err(ApiError::conflict(format!("The index could not be rebuilt: {e}")))
         }
     }
 }
 
-async fn archive_overview_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+async fn archive_overview_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<protect_api_types::ArchiveOverview>, ApiError> {
+    require_auth(&state, &jar).await?;
     let settings = db::load_settings(&state.pool).await.unwrap_or_default();
-    match archive::run::overview(
-        &state.pool,
-        &settings,
-        &state.config.backup_dir,
-        &state.config.archive_dir,
-    )
-    .await
-    {
-        Ok(o) => Json(o).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+    Ok(Json(
+        archive::run::overview(
+            &state.pool,
+            &settings,
+            &state.config.backup_dir,
+            &state.config.archive_dir,
+        )
+        .await?,
+    ))
 }
 
-async fn archive_runs_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match archive::run::recent_runs(&state.pool, 50).await {
-        Ok(runs) => Json(runs).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+async fn archive_runs_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<protect_api_types::ArchiveRun>>, ApiError> {
+    require_auth(&state, &jar).await?;
+    Ok(Json(archive::run::recent_runs(&state.pool, 50).await?))
 }
 
 async fn start_archive_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(body): Json<StartArchiveRequest>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&state, &jar).await?;
     let settings = match db::load_settings(&state.pool).await {
         Ok(s) if s.setup_complete => s,
-        _ => return (StatusCode::CONFLICT, "setup is not complete").into_response(),
+        _ => return Err(ApiError::setup_incomplete()),
     };
 
-    match archive::run::run_archive(
+    // Refusals here are all "not now": a job is already running, or nothing is
+    // old enough to archive. Neither is a fault.
+    let id = archive::run::run_archive(
         state.job_context(),
         settings,
         body.targets,
@@ -864,38 +861,33 @@ async fn start_archive_handler(
         false,
     )
     .await
-    {
-        Ok(id) => Json(serde_json::json!({ "run_id": id })).into_response(),
-        Err(e) => (StatusCode::CONFLICT, format!("{e}")).into_response(),
-    }
+    .map_err(|e| ApiError::conflict(format!("{e}")))?;
+
+    Ok(Json(serde_json::json!({ "run_id": id })))
 }
 
 async fn restore_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(target): Json<CameraMonth>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match archive::run::run_restore(state.job_context(), target).await {
-        Ok(id) => Json(serde_json::json!({ "run_id": id })).into_response(),
-        Err(e) => (StatusCode::CONFLICT, format!("{e}")).into_response(),
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&state, &jar).await?;
+    let id = archive::run::run_restore(state.job_context(), target)
+        .await
+        .map_err(|e| ApiError::conflict(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "run_id": id })))
 }
 
 async fn verify_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(target): Json<CameraMonth>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match archive::run::run_verify(state.job_context(), target).await {
-        Ok(id) => Json(serde_json::json!({ "run_id": id })).into_response(),
-        Err(e) => (StatusCode::CONFLICT, format!("{e}")).into_response(),
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_auth(&state, &jar).await?;
+    let id = archive::run::run_verify(state.job_context(), target)
+        .await
+        .map_err(|e| ApiError::conflict(format!("{e}")))?;
+    Ok(Json(serde_json::json!({ "run_id": id })))
 }
 
 #[derive(Deserialize)]
@@ -910,42 +902,36 @@ async fn pin_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(body): Json<PinRequest>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let result = sqlx::query("UPDATE archives SET pinned = ? WHERE camera = ? AND month = ?")
+) -> Result<StatusCode, ApiError> {
+    require_auth(&state, &jar).await?;
+    sqlx::query("UPDATE archives SET pinned = ? WHERE camera = ? AND month = ?")
         .bind(body.pinned as i32)
         .bind(&body.camera)
         .bind(&body.month)
         .execute(&state.pool)
-        .await;
-
-    match result {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_schedule_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    Json(archive::schedule::load(&state.pool).await).into_response()
+async fn get_schedule_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Schedule>, ApiError> {
+    require_auth(&state, &jar).await?;
+    Ok(Json(archive::schedule::load(&state.pool).await))
 }
 
 async fn put_schedule_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(body): Json<Schedule>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
+) -> Result<Json<Schedule>, ApiError> {
+    require_auth(&state, &jar).await?;
+    if let Some(problem) = archive::schedule::validation_error(&body) {
+        return Err(ApiError::invalid(problem));
     }
-    match archive::schedule::save(&state.pool, &body).await {
-        Ok(_) => Json(archive::schedule::load(&state.pool).await).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+    archive::schedule::save(&state.pool, &body).await?;
+    Ok(Json(archive::schedule::load(&state.pool).await))
 }
 
 /// Live job progress. Same cookie auth as the log stream.
@@ -953,37 +939,34 @@ async fn progress_ws(
     State(state): State<AppState>,
     jar: CookieJar,
     ws: WebSocketUpgrade,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+) -> Result<Response, ApiError> {
+    require_auth(&state, &jar).await?;
     let mut rx = state.jobs.progress.subscribe();
-    ws.on_upgrade(move |mut socket| async move {
+    Ok(ws.on_upgrade(move |mut socket| async move {
         while let Ok(update) = rx.recv().await {
             let Ok(text) = serde_json::to_string(&update) else { continue };
             if socket.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
         }
-    })
+    }))
 }
 
-async fn storage_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+async fn storage_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<protect_api_types::StorageSnapshot>, ApiError> {
+    require_auth(&state, &jar).await?;
     let settings = db::load_settings(&state.pool).await.unwrap_or_default();
-    match storage::snapshot(
-        &state.pool,
-        &settings,
-        &state.config.backup_dir,
-        &state.config.archive_dir,
-    )
-    .await
-    {
-        Ok(s) => Json(s).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+    Ok(Json(
+        storage::snapshot(
+            &state.pool,
+            &settings,
+            &state.config.backup_dir,
+            &state.config.archive_dir,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1000,14 +983,9 @@ async fn storage_history_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(q): Query<HistoryQuery>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match storage::history(&state.pool, q.days.clamp(1.0, 365.0)).await {
-        Ok(h) => Json(h).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+) -> Result<Json<Vec<protect_api_types::StorageSample>>, ApiError> {
+    require_auth(&state, &jar).await?;
+    Ok(Json(storage::history(&state.pool, q.days.clamp(1.0, 365.0)).await?))
 }
 
 /// Resolve an event id to a clip we are allowed to open.
@@ -1016,30 +994,33 @@ async fn storage_history_handler(
 /// archived or missing clip has no file), and the path must actually be under
 /// the backup directory — it is derived from another program's data, so it is
 /// verified rather than trusted.
-async fn resolve_clip(state: &AppState, id: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+async fn resolve_clip(state: &AppState, id: &str) -> Result<std::path::PathBuf, ApiError> {
     let row: Option<(Option<String>, String)> =
         sqlx::query_as("SELECT clip_path, status FROM events WHERE id = ?")
             .bind(id)
             .fetch_optional(&state.pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .await?;
 
     let Some((path, status)) = row else {
-        return Err((StatusCode::NOT_FOUND, "no such event".into()));
+        return Err(ApiError::not_found("There is no event with that id."));
     };
     let Some(path) = path else {
-        return Err((StatusCode::NOT_FOUND, "this event was never backed up".into()));
+        return Err(ApiError::not_found("This event was never backed up."));
     };
     if status != "live" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("the clip is not in the live directory ({status})"),
-        ));
+        return Err(ApiError::not_found(match status.as_str() {
+            "archived" => "This clip has been archived.".to_string(),
+            _ => format!("This clip is not in the live directory ({status})."),
+        }));
     }
 
     let path = std::path::PathBuf::from(path);
     if !media::within(&state.config.backup_dir, &path) {
-        return Err((StatusCode::FORBIDDEN, "clip path is outside the backup directory".into()));
+        // The path came out of another program's database, so it is checked
+        // rather than trusted. Reaching here means the index disagrees with
+        // the configuration, which is worth a log line.
+        tracing::warn!(%id, "indexed clip path is outside the backup directory");
+        return Err(ApiError::not_found("That clip is outside the backup directory."));
     }
     Ok(path)
 }
@@ -1048,17 +1029,18 @@ async fn clip_info_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     UrlPath(id): UrlPath<String>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
+) -> Result<Json<ClipInfo>, ApiError> {
+    require_auth(&state, &jar).await?;
+    // Unavailability is the answer here rather than an error: the timeline asks
+    // about clips it already knows may be archived, and a 404 per tile would
+    // be noise in the console for something entirely expected.
     let path = match resolve_clip(&state, &id).await {
         Ok(p) => p,
-        Err((_, reason)) => {
-            return Json(ClipInfo {
+        Err(e) => {
+            return Ok(Json(ClipInfo {
                 id,
                 available: false,
-                reason: Some(reason),
+                reason: Some(e.to_string()),
                 codec: None,
                 width: None,
                 height: None,
@@ -1066,8 +1048,7 @@ async fn clip_info_handler(
                 fps: None,
                 direct: false,
                 prepared: false,
-            })
-            .into_response()
+            }))
         }
     };
 
@@ -1078,7 +1059,7 @@ async fn clip_info_handler(
         .unwrap_or(false);
     let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len() as i64);
 
-    Json(ClipInfo {
+    Ok(Json(ClipInfo {
         prepared: direct || state.media.is_prepared(&id),
         available: true,
         reason: None,
@@ -1089,8 +1070,7 @@ async fn clip_info_handler(
         fps: probed.as_ref().and_then(|p| p.fps),
         direct,
         id,
-    })
-    .into_response()
+    }))
 }
 
 async fn thumb_handler(
@@ -1098,18 +1078,18 @@ async fn thumb_handler(
     jar: CookieJar,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let source = match resolve_clip(&state, &id).await {
-        Ok(p) => p,
-        Err((code, msg)) => return (code, msg).into_response(),
-    };
-    match state.media.thumbnail(&id, &source).await {
-        Ok(p) => media::range::serve_file(&p, "image/jpeg", &headers).await,
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+) -> Result<Response, ApiError> {
+    require_auth(&state, &jar).await?;
+    let source = resolve_clip(&state, &id).await?;
+    // A clip that will not decode is a truncated or in-progress download, not
+    // a server fault — reporting it as a 500 sent people looking for a bug in
+    // the app when the answer was to wait for the download to finish.
+    let thumb = state
+        .media
+        .thumbnail(&id, &source)
+        .await
+        .map_err(ApiError::media_unreadable)?;
+    Ok(media::range::serve_file(&thumb, "image/jpeg", &headers).await)
 }
 
 /// A clip the browser can play, transcoding first if it has to.
@@ -1118,18 +1098,15 @@ async fn clip_handler(
     jar: CookieJar,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let source = match resolve_clip(&state, &id).await {
-        Ok(p) => p,
-        Err((code, msg)) => return (code, msg).into_response(),
-    };
-    match state.media.playable(&id, &source).await {
-        Ok(clip) => media::range::serve_file(&clip.path, "video/mp4", &headers).await,
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+) -> Result<Response, ApiError> {
+    require_auth(&state, &jar).await?;
+    let source = resolve_clip(&state, &id).await?;
+    let clip = state
+        .media
+        .playable(&id, &source)
+        .await
+        .map_err(ApiError::media_unreadable)?;
+    Ok(media::range::serve_file(&clip.path, "video/mp4", &headers).await)
 }
 
 /// The recording itself, untouched — for downloading the real thing.
@@ -1138,35 +1115,28 @@ async fn original_handler(
     jar: CookieJar,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match resolve_clip(&state, &id).await {
-        Ok(p) => media::range::serve_file(&p, "video/mp4", &headers).await,
-        Err((code, msg)) => (code, msg).into_response(),
-    }
+) -> Result<Response, ApiError> {
+    require_auth(&state, &jar).await?;
+    let path = resolve_clip(&state, &id).await?;
+    Ok(media::range::serve_file(&path, "video/mp4", &headers).await)
 }
 
-async fn watchdog_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    Json(watchdog::state(&state.pool).await).into_response()
+async fn watchdog_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<protect_api_types::WatchdogState>, ApiError> {
+    require_auth(&state, &jar).await?;
+    Ok(Json(watchdog::state(&state.pool).await))
 }
 
 async fn watchdog_config_handler(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(body): Json<WatchdogConfig>,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    match watchdog::save_config(&state.pool, &body).await {
-        Ok(_) => Json(watchdog::state(&state.pool).await).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+) -> Result<Json<protect_api_types::WatchdogState>, ApiError> {
+    require_auth(&state, &jar).await?;
+    watchdog::save_config(&state.pool, &body).await?;
+    Ok(Json(watchdog::state(&state.pool).await))
 }
 
 #[derive(Deserialize)]
@@ -1185,21 +1155,16 @@ async fn logs_ws(
     jar: CookieJar,
     Query(q): Query<LogQuery>,
     ws: WebSocketUpgrade,
-) -> Response {
-    if let Err(r) = require_auth(&state, &jar).await {
-        return r;
-    }
-    let Some(docker) = state.docker.clone() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "docker unavailable").into_response();
-    };
+) -> Result<Response, ApiError> {
+    require_auth(&state, &jar).await?;
+    let docker = state.docker.clone().ok_or_else(ApiError::docker_unavailable)?;
 
-    let container = match current_container(&state, &docker).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return (StatusCode::NOT_FOUND, "no backup container found").into_response(),
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
-    };
+    let container = current_container(&state, &docker)
+        .await
+        .map_err(ApiError::docker_failed)?
+        .ok_or_else(|| ApiError::container_not_found(&state.config.upb_image))?;
 
-    ws.on_upgrade(move |socket| stream_logs(socket, docker, container.id, q.tail))
+    Ok(ws.on_upgrade(move |socket| stream_logs(socket, docker, container.id, q.tail)))
 }
 
 async fn stream_logs(

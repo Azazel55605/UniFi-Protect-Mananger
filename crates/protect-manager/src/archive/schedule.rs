@@ -43,6 +43,39 @@ pub async fn load(pool: &SqlitePool) -> Schedule {
     schedule
 }
 
+/// Why a schedule would never fire, if it wouldn't.
+///
+/// This app exists because cron was silently not running. A schedule that is
+/// accepted and then never fires would be the same failure wearing a different
+/// hat, so the cases that cannot fire are refused at the point of saving —
+/// where there is someone present to read the reason.
+pub fn validation_error(schedule: &Schedule) -> Option<String> {
+    if matches!(schedule.kind, ScheduleKind::Off) {
+        return None;
+    }
+    if schedule.hour > 23 {
+        return Some(format!(
+            "Hour must be between 0 and 23, and {} is not.",
+            schedule.hour
+        ));
+    }
+    if matches!(schedule.kind, ScheduleKind::Monthly) && !(1..=28).contains(&schedule.day) {
+        // 28 rather than 31: a run set for the 30th would skip February
+        // entirely, which is the kind of quiet gap that is only noticed a year
+        // later when the footage is wanted.
+        return Some(format!(
+            "Day must be between 1 and 28 so that it exists in every month, and {} is not.",
+            schedule.day
+        ));
+    }
+    match schedule.webhook_url.as_deref().map(str::trim) {
+        Some(url) if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") => {
+            Some("The webhook URL must start with http:// or https://.".into())
+        }
+        _ => None,
+    }
+}
+
 pub async fn save(pool: &SqlitePool, schedule: &Schedule) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO schedule (id, json) VALUES (1, ?)
@@ -211,6 +244,65 @@ fn url_addr(url: &str) -> Option<String> {
     }
     let host = url_host(url);
     Some(if host.contains(':') { host.to_string() } else { format!("{host}:80") })
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn monthly(day: u32, hour: u32) -> Schedule {
+        Schedule {
+            kind: ScheduleKind::Monthly,
+            day,
+            hour,
+            catch_up: true,
+            webhook_url: None,
+            next_run: None,
+            last_run: None,
+        }
+    }
+
+    #[test]
+    fn a_workable_schedule_is_accepted() {
+        assert!(validation_error(&monthly(1, 0)).is_none());
+        assert!(validation_error(&monthly(28, 23)).is_none());
+    }
+
+    #[test]
+    fn a_day_that_some_months_do_not_have_is_refused() {
+        // The whole point of this app is that a schedule which silently skips
+        // is worse than one that refuses to be set.
+        for day in [0, 29, 30, 31] {
+            assert!(validation_error(&monthly(day, 3)).is_some(), "day {day}");
+        }
+    }
+
+    #[test]
+    fn an_impossible_hour_is_refused() {
+        assert!(validation_error(&monthly(1, 24)).is_some());
+    }
+
+    #[test]
+    fn a_disabled_schedule_is_never_wrong() {
+        // Nothing about an off schedule can fail to fire.
+        let mut s = monthly(31, 99);
+        s.kind = ScheduleKind::Off;
+        assert!(validation_error(&s).is_none());
+    }
+
+    #[test]
+    fn a_webhook_that_cannot_be_posted_to_is_refused() {
+        let mut s = monthly(1, 3);
+        s.webhook_url = Some("example.com/hook".into());
+        assert!(validation_error(&s).is_some());
+
+        // Empty means "no webhook", which is how the form clears the field.
+        s.webhook_url = Some("  ".into());
+        assert!(validation_error(&s).is_none());
+
+        s.webhook_url = Some("https://homeassistant.local/api/webhook/x".into());
+        assert!(validation_error(&s).is_none());
+    }
 }
 
 #[cfg(test)]

@@ -62,6 +62,11 @@ storage on a schedule, and see whether the pipeline is actually working.
 | `home` / `end` | Start or end of the clip |
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
+- Sign-in backoff, and a list of every session that can sign in as you — with
+  one button to end all of them but the one you are using
+- Classified errors: the app can tell "setup isn't finished" from "a job is
+  already running" rather than guessing from a status code, and a server fault
+  shows an id that appears verbatim in the container log
 
 ## Running it
 
@@ -114,6 +119,7 @@ than showing an empty list.
 | ✅ | **Archiving** | Packs old clips into per-camera monthly archives, verifies every file before deleting anything, runs on a schedule, and browses, verifies and restores archives |
 | ✅ | **Capacity dashboard** | Filesystem usage, growth over time, live vs archived split, per-camera breakdown |
 | ✅ | **Timeline and playback** | A day as a strip of marks, thumbnails, and inline playback — clips are HEVC, so they are transcoded on demand and cached |
+| ✅ | **Hardening** | Classified errors, request ids, sign-in backoff, session revocation, CI and published images |
 | ⬜ | **Mobile layouts** | Desktop-first for now; the timeline needs a different treatment on a phone |
 
 ## Configuration
@@ -130,7 +136,7 @@ than showing an empty list.
 | `PM_ARCHIVE_DIR` | `/archive` | Where `.tar` archives are written |
 | `PM_STATE_DIR` | `/var/lib/protect-manager` | Our database and caches |
 | `PM_STATIC_DIR` | `web/dist` | Where the built frontend is served from |
-| `PM_LOG` | `protect_manager=info` | `tracing` filter |
+| `PM_LOG` | `protect_manager=info` | `tracing` filter. `protect_manager=debug` logs one line per request with its id, status and duration |
 
 Everything else is configured in the app's setup flow rather than here:
 deploying this for the first time should not require hand-editing config.
@@ -142,6 +148,8 @@ deploying this for the first time should not require hand-editing config.
 | `GET /api/auth/status` | Whether you're signed in, and whether a password is configured |
 | `POST /api/auth/login` | `{"password": "..."}` → session cookie |
 | `POST /api/auth/logout` | Revoke the session |
+| `GET /api/auth/sessions` | Every live session; tokens are never returned |
+| `POST /api/auth/sessions/revoke-others` | Sign out everywhere except here |
 | `GET /api/health` | Docker, container and clip-directory checks |
 | `GET /api/setup` | Saved settings, re-validated against the filesystem |
 | `GET /api/setup/discover` | Containers, derived paths and camera candidates |
@@ -182,6 +190,28 @@ so run them inside the deployed container to see what the server actually got.
 
 Everything except the auth endpoints requires a session.
 
+### Errors
+
+Every failure answers with the same JSON shape, so a client has one thing to
+parse:
+
+```json
+{
+  "code": "setup_incomplete",
+  "message": "Setup has not been finished yet.",
+  "hint": "Finish the setup wizard so the app knows where your footage lives.",
+  "checks": null,
+  "retry_after_secs": null,
+  "request_id": null
+}
+```
+
+`code` is the part to branch on — status codes are too coarse, since a 409 is
+both "setup isn't finished" and "a job is already running". `request_id` is set
+on server faults only, and matches both the `x-request-id` response header and
+the log line that recorded the cause. The cause itself is never sent: it goes to
+the log, and the client gets the id that finds it.
+
 ## Development
 
 ```bash
@@ -189,6 +219,11 @@ cargo test                    # Rust unit tests
 cargo clippy --all-targets
 cd web && pnpm run typecheck  # frontend
 ```
+
+CI runs all three on every push and pull request, builds the image, and
+publishes it to `ghcr.io` from `main` and from `v*` tags. It also fails if
+`types.gen.ts` is out of date, which is the one way the contract could drift
+without anything else noticing.
 
 `crates/protect-api-types` is the API contract. `cargo test -p protect-api-types`
 regenerates `web/src/lib/types.gen.ts`, which is committed — so a change to a
@@ -199,6 +234,15 @@ response shape that breaks the frontend breaks `tsc` rather than surfacing as
 
 A few decisions that are easy to mistake for accidents:
 
+- **Sign-in backoff is about CPU, not secrecy.** Verifying an argon2 hash is
+  deliberately expensive, so an unthrottled login endpoint is an exhaustion
+  primitive long before it is a way in. Blocked attempts are rejected before
+  the hash is verified, which is the whole point — and a second, global bucket
+  means rotating source addresses cannot walk around it.
+- **Errors say what kind of failure they are, and faults carry an id.** The
+  cause of a server fault is logged, never sent; what the browser shows is an
+  eight-character id that appears verbatim in the container log, so a
+  screenshot is enough to find the line that explains it.
 - **The backup container is found by image, not by name.** Compose deployments
   that don't set `container_name` get a generated one, and it changes whenever
   the container is recreated. A stale id falls back to discovery.

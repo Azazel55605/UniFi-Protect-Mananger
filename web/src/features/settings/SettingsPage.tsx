@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import { AppearancePicker } from "@/components/AppearanceControls";
 import { SettingsSummary } from "@/features/setup/SetupWizard";
+import { SessionsPanel } from "@/features/settings/SessionsPanel";
 import { WatchdogPanel } from "@/features/watchdog/WatchdogPanel";
 
 export function SettingsPage({ onReconfigure }: { onReconfigure: () => void }) {
@@ -14,6 +15,8 @@ export function SettingsPage({ onReconfigure }: { onReconfigure: () => void }) {
       <SettingsSummary />
 
       <WatchdogPanel />
+
+      <SessionsPanel />
 
       <Panel>
         <PanelHeader label="Appearance" />

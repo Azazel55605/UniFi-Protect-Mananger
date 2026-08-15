@@ -10,16 +10,20 @@
 //! An unattended archive scheduler that logs you out every time it redeploys
 //! would be its own small annoyance.
 
+use std::net::SocketAddr;
+
 use password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use protect_api_types::{AuthStatus, LoginRequest};
+use protect_api_types::{AuthStatus, LoginRequest, SessionInfo};
 
+use crate::error::ApiError;
+use crate::ratelimit::ClientAddr;
 use crate::{db, AppState};
 
 pub const COOKIE_NAME: &str = "pm_session";
@@ -156,12 +160,52 @@ fn verify(hash: &str, password: &str) -> bool {
     }
 }
 
+/// The token of the live session on this request, if there is one.
+///
+/// Returns the token rather than a bare yes/no because the session list and
+/// "sign out everywhere" both need to know *which* session is asking.
+pub async fn session_token(state: &AppState, jar: &CookieJar) -> Option<String> {
+    let token = jar.get(COOKIE_NAME)?.value().to_string();
+    if !db::session_valid(&state.pool, &token).await {
+        return None;
+    }
+    db::touch_session(&state.pool, &token).await;
+    Some(token)
+}
+
 /// True when the request carries a live session cookie.
 pub async fn authenticated(state: &AppState, jar: &CookieJar) -> bool {
-    match jar.get(COOKIE_NAME) {
-        Some(c) => db::session_valid(&state.pool, c.value()).await,
-        None => false,
+    session_token(state, jar).await.is_some()
+}
+
+/// How the rate limiter tells one client from another.
+///
+/// `X-Forwarded-For` is used when present, because behind a reverse proxy the
+/// socket address is the proxy and every client would otherwise share a single
+/// bucket. It is worth saying plainly that a client can forge this header if
+/// it can reach this port directly — which is why the limiter also keeps a
+/// global bucket that no key can escape.
+fn client_key(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| peer.map(|p| p.ip().to_string()))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// A browser's self-description, shortened to something a person can scan.
+///
+/// The full string is a paragraph of compatibility tokens; what makes a row
+/// recognisable in the session list is the front of it.
+fn short_user_agent(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("user-agent")?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
     }
+    Some(raw.chars().take(120).collect())
 }
 
 pub async fn status(State(state): State<AppState>, jar: CookieJar) -> Json<AuthStatus> {
@@ -203,33 +247,47 @@ fn warn_if_cookie_will_be_dropped(headers: &HeaderMap, cookie_secure: bool) {
 
 pub async fn login(
     State(state): State<AppState>,
+    ClientAddr(peer): ClientAddr,
     headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<LoginRequest>,
-) -> impl IntoResponse {
+) -> Result<Response, ApiError> {
     let Some(hash) = state.config.password_hash.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no password configured; set PM_PASSWORD_HASH",
-        )
-            .into_response();
+        return Err(ApiError::conflict("No password is configured on the server.")
+            .hint("Set PM_PASSWORD_HASH, generated with: protect-manager hash-password <password>"));
     };
 
-    if !verify(hash, &body.password) {
-        // Deliberately vague, and deliberately not logged with the attempt:
-        // there is exactly one account, so a failure is either you or someone
-        // who is already inside the VPN.
-        return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
+    let key = client_key(&headers, peer);
+    let now = crate::upb::reconcile::now_secs();
+
+    // Checked before the hash is verified: the cost of argon2 is the thing
+    // being rationed, so paying it first would defeat the point.
+    if let Some(wait) = state.limiter.retry_after(&key, now) {
+        tracing::warn!(client = %key, wait_secs = wait, "sign-in throttled");
+        return Err(ApiError::rate_limited(wait));
     }
 
+    if !verify(hash, &body.password) {
+        state.limiter.record_failure(&key, now);
+        // Deliberately vague to the client: there is exactly one account, so
+        // there is nothing to disambiguate and nothing worth confirming.
+        return Err(ApiError::unauthenticated()
+            .hint("Check the password, or run 'protect-manager verify-password' in the container."));
+    }
+
+    state.limiter.record_success(&key);
     warn_if_cookie_will_be_dropped(&headers, state.config.cookie_secure);
 
     let token = new_token();
-    if let Err(e) = db::create_session(&state.pool, &token, state.config.session_ttl_secs as i64).await
-    {
-        tracing::error!("could not persist session: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "could not create session").into_response();
-    }
+    db::create_session(
+        &state.pool,
+        &token,
+        state.config.session_ttl_secs as i64,
+        short_user_agent(&headers).as_deref(),
+        Some(&key),
+    )
+    .await
+    .map_err(ApiError::internal)?;
 
     let mut cookie = Cookie::new(COOKIE_NAME, token);
     cookie.set_http_only(true);
@@ -238,7 +296,7 @@ pub async fn login(
     cookie.set_path("/");
     cookie.set_max_age(time::Duration::seconds(state.config.session_ttl_secs as i64));
 
-    (jar.add(cookie), StatusCode::NO_CONTENT).into_response()
+    Ok((jar.add(cookie), axum::http::StatusCode::NO_CONTENT).into_response())
 }
 
 pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
@@ -247,7 +305,26 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> impl IntoR
     }
     let mut removal = Cookie::from(COOKIE_NAME);
     removal.set_path("/");
-    (jar.remove(removal), StatusCode::NO_CONTENT)
+    (jar.remove(removal), axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Every session currently able to sign in as you.
+pub async fn sessions(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<SessionInfo>>, ApiError> {
+    let token = session_token(&state, &jar).await.ok_or_else(ApiError::unauthenticated)?;
+    Ok(Json(db::list_sessions(&state.pool, &token).await?))
+}
+
+/// Sign out every session but this one.
+pub async fn revoke_others(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> Result<Json<Vec<SessionInfo>>, ApiError> {
+    let token = session_token(&state, &jar).await.ok_or_else(ApiError::unauthenticated)?;
+    db::revoke_other_sessions(&state.pool, &token).await?;
+    Ok(Json(db::list_sessions(&state.pool, &token).await?))
 }
 
 #[cfg(test)]
@@ -299,6 +376,42 @@ mod tests {
             assert!(diagnose_hash(&cleaned).is_none(), "failed for {raw:?}");
             assert!(password_matches(&cleaned, "correct horse"));
         }
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(*name, value.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn the_forwarded_client_is_preferred_over_the_proxy() {
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+
+        // A proxy chain: the original client is the first entry.
+        let h = headers(&[("x-forwarded-for", "203.0.113.9, 10.0.0.1")]);
+        assert_eq!(client_key(&h, Some(peer)), "203.0.113.9");
+
+        // Without the header there is only the socket, and the port is not
+        // part of identity — a client gets a new one on every connection.
+        assert_eq!(client_key(&HeaderMap::new(), Some(peer)), "10.0.0.1");
+
+        // An empty header must not become an empty key shared by everyone.
+        let blank = headers(&[("x-forwarded-for", "")]);
+        assert_eq!(client_key(&blank, Some(peer)), "10.0.0.1");
+        assert_eq!(client_key(&HeaderMap::new(), None), "unknown");
+    }
+
+    #[test]
+    fn the_user_agent_is_shortened_rather_than_stored_whole() {
+        let long = "Mozilla/5.0 ".repeat(40);
+        let h = headers(&[("user-agent", long.as_str())]);
+        assert_eq!(short_user_agent(&h).unwrap().len(), 120);
+
+        assert!(short_user_agent(&HeaderMap::new()).is_none());
+        assert!(short_user_agent(&headers(&[("user-agent", " ")])).is_none());
     }
 
     #[test]

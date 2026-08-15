@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "@/lib/api";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ErrorNotice } from "@/components/ui/notice";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import { Tally } from "@/components/ui/tally";
 import type { WatchdogConfig } from "@/lib/types.gen";
@@ -13,7 +14,7 @@ export function WatchdogPanel() {
   const queryClient = useQueryClient();
   const { data } = useQuery({ queryKey: ["watchdog"], queryFn: api.watchdog });
   const [draft, setDraft] = useState<WatchdogConfig | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
     if (data && !draft) setDraft(data.config);
@@ -26,7 +27,7 @@ export function WatchdogPanel() {
       setError(null);
       queryClient.invalidateQueries({ queryKey: ["watchdog"] });
     },
-    onError: (e) => setError(e instanceof ApiError ? e.message : "Could not save"),
+    onError: setError,
   });
 
   if (!draft || !data) return null;
@@ -131,7 +132,7 @@ export function WatchdogPanel() {
           </>
         )}
 
-        {error && <p className="text-sm text-bad">{error}</p>}
+        {error != null && <ErrorNotice error={error} />}
 
         <div className="flex items-center gap-3">
           <Button

@@ -31,6 +31,90 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+// -------------------------------------------------------------- errors
+
+/// What kind of failure this is, independent of the words describing it.
+///
+/// HTTP status alone is too coarse to act on: a 409 might mean setup is
+/// unfinished, or that a job is already running, and the UI wants to respond
+/// differently to each. The code is the part the frontend branches on; the
+/// message is the part a person reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// No valid session. The UI returns to the login screen.
+    Unauthenticated,
+    /// Too many failed logins. `retry_after_secs` says when to try again.
+    RateLimited,
+    /// The app is running but has not been told where anything is yet.
+    SetupIncomplete,
+    /// The Docker socket is missing or unresponsive — everything that reads
+    /// the backup container is unavailable, but the rest of the app is not.
+    DockerUnavailable,
+    /// Docker answered, but no container matches the configured image.
+    ContainerNotFound,
+    /// Docker answered with a failure of its own.
+    DockerFailed,
+    /// The thing asked for does not exist.
+    NotFound,
+    /// The request was understood but conflicts with the current state — a job
+    /// already running, a month already archived.
+    Conflict,
+    /// The request itself is malformed or fails validation.
+    Invalid,
+    /// A clip exists but cannot be decoded — truncated, or still being
+    /// written. Distinct from `Internal`: nothing here is broken.
+    MediaUnreadable,
+    /// Something went wrong on our side. `request_id` ties it to the log line.
+    Internal,
+}
+
+/// The body of every error response.
+///
+/// Uniform, so the frontend has exactly one thing to parse. Fields that do not
+/// apply are `null` rather than absent — the generated TypeScript then
+/// describes the wire accurately.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct ApiErrorBody {
+    pub code: ErrorCode,
+    /// One sentence, addressed to the person reading it.
+    pub message: String,
+    /// What to do about it, when there is something to do.
+    pub hint: Option<String>,
+    /// Which settings failed validation, for the setup wizard.
+    pub checks: Option<Vec<NamedCheck>>,
+    /// Seconds until a rate-limited request will be accepted.
+    pub retry_after_secs: Option<f64>,
+    /// Present on server faults, and matches `x-request-id` and the log line,
+    /// so a screenshot is enough to find the cause.
+    pub request_id: Option<String>,
+}
+
+// ------------------------------------------------------------ sessions
+
+/// A live session, for the "signed in on" list.
+///
+/// The token itself never appears here. `id` is a short prefix, enough to tell
+/// two rows apart and useless for authenticating.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct SessionInfo {
+    pub id: String,
+    pub created: f64,
+    pub last_seen: f64,
+    pub expires: f64,
+    /// The browser, as it described itself. Trimmed to something readable.
+    pub user_agent: Option<String>,
+    /// Where it signed in from. Behind a reverse proxy this is the proxy
+    /// unless it forwards the original address.
+    pub address: Option<String>,
+    /// True for the session making this request — the one row you should not
+    /// be surprised to see.
+    pub current: bool,
+}
+
 // -------------------------------------------------------------- health
 
 #[derive(Debug, Serialize, Deserialize, TS)]

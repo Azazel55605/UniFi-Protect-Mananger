@@ -6,6 +6,7 @@
  * place — and the app stays portable if it is ever served from somewhere else.
  */
 import type {
+  ApiErrorBody,
   ArchiveOverview,
   ArchiveRun,
   AuthStatus,
@@ -16,10 +17,12 @@ import type {
   StartArchiveRequest,
   DiscoveryResult,
   EventPage,
+  ErrorCode,
   EventQuery,
   Health,
   IndexStats,
   NamedCheck,
+  SessionInfo,
   Settings,
   SetupState,
   StorageSample,
@@ -29,13 +32,35 @@ import type {
   UpbInspection,
 } from "./types.gen";
 
+/**
+ * A failure the server classified.
+ *
+ * `code` is what the UI branches on — a 409 alone cannot distinguish "setup
+ * isn't finished" from "a job is already running", and those want different
+ * screens. `message` is the sentence to show; `hint` is the next step, when
+ * there is one.
+ */
 export class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-    readonly checks?: NamedCheck[],
-  ) {
-    super(message);
+  readonly code: ErrorCode;
+  readonly hint?: string;
+  readonly checks?: NamedCheck[];
+  /** Seconds until a rate-limited request will be accepted. */
+  readonly retryAfter?: number;
+  /** Matches the server log line. Present on server faults only. */
+  readonly requestId?: string;
+
+  constructor(readonly status: number, body: Partial<ApiErrorBody> & { message: string }) {
+    super(body.message);
+    this.code = body.code ?? "internal";
+    this.hint = body.hint ?? undefined;
+    this.checks = body.checks ?? undefined;
+    this.retryAfter = body.retry_after_secs ?? undefined;
+    this.requestId = body.request_id ?? undefined;
+  }
+
+  /** True when the session is gone and the app should return to the login screen. */
+  get isAuthFailure() {
+    return this.code === "unauthenticated" || this.status === 401;
   }
 }
 
@@ -46,22 +71,31 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    // Settings validation answers with the failing checks; keep them typed so
-    // the wizard can show which step is at fault instead of a generic message.
-    try {
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) {
-        throw new ApiError(res.status, "Some settings are not valid", parsed);
-      }
-    } catch (e) {
-      if (e instanceof ApiError) throw e;
-    }
-    throw new ApiError(res.status, text || res.statusText);
-  }
+  if (!res.ok) throw await asApiError(res);
 
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
+}
+
+/**
+ * Every API error has the same shape, but not everything that can answer this
+ * app does — a reverse proxy returning its own 502 page, say. So parse the
+ * shape when it is there and fall back to something honest when it isn't.
+ */
+async function asApiError(res: Response): Promise<ApiError> {
+  const text = await res.text().catch(() => "");
+
+  try {
+    const parsed = JSON.parse(text) as Partial<ApiErrorBody>;
+    if (parsed && typeof parsed.message === "string") {
+      return new ApiError(res.status, parsed as ApiErrorBody);
+    }
+  } catch {
+    // Not JSON. Falls through to the text below.
+  }
+
+  return new ApiError(res.status, {
+    message: text.trim() || res.statusText || `Request failed (${res.status})`,
+  });
 }
 
 export const api = {
@@ -74,6 +108,11 @@ export const api = {
     }),
 
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
+
+  sessions: () => request<SessionInfo[]>("/api/auth/sessions"),
+
+  revokeOtherSessions: () =>
+    request<SessionInfo[]>("/api/auth/sessions/revoke-others", { method: "POST" }),
 
   health: () => request<Health>("/api/health"),
 

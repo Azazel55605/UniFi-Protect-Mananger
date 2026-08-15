@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "protect-api-types"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "ts-rs",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "protect-manager"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1204,6 +1204,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

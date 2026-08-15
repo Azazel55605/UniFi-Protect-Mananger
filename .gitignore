@@ -6,3 +6,6 @@ dist/
 .playwright-mcp/
 shots/
 PLAN.md
+
+# Incremental typecheck cache: rewritten by every build, useful to no one else.
+*.tsbuildinfo

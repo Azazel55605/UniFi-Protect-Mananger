@@ -57,6 +57,17 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
 
+    // Added after the table existed in the field, so they arrive by ALTER
+    // rather than by changing the CREATE above — which SQLite would ignore for
+    // anyone who already has the database.
+    for (table, column, decl) in [
+        ("sessions", "last_seen", "INTEGER"),
+        ("sessions", "user_agent", "TEXT"),
+        ("sessions", "address", "TEXT"),
+    ] {
+        add_column_if_missing(pool, table, column, decl).await?;
+    }
+
     // The event index. This is a derived copy of the backup service's data,
     // enriched with everything it doesn't store: camera names, detection
     // subtypes, clip presence and size. Safe to drop and rebuild at any time.
@@ -201,6 +212,41 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Add a column to an existing table, if it is not already there.
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, and `CREATE TABLE IF NOT EXISTS`
+/// silently does nothing when the table exists — so a column added to the
+/// schema above would never appear for anyone who already ran an older build.
+/// Asking `PRAGMA table_info` first is what makes the migration idempotent.
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> anyhow::Result<()> {
+    // `AssertSqlSafe` because the statement is assembled at runtime, which sqlx
+    // refuses by default. The assertion holds: every `table`, `column` and
+    // `decl` passed here is a literal written a few lines above, and none of
+    // them comes from a request. This is the one place in the file where SQL is
+    // built rather than written out, and the wrapper marks it as such.
+    let sql = format!("PRAGMA table_info({table})");
+    let existing: Vec<String> = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| r.get::<String, _>("name"))
+        .collect();
+
+    if existing.iter().any(|c| c == column) {
+        return Ok(());
+    }
+
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(pool).await?;
+    tracing::info!("migrated: added {table}.{column}");
+    Ok(())
+}
+
 /// Mark any run still recorded as in-progress as interrupted.
 ///
 /// Called once at startup. A process that dies mid-archive leaves a row that
@@ -287,14 +333,26 @@ pub async fn save_settings(pool: &SqlitePool, settings: &Settings) -> anyhow::Re
 
 // ------------------------------------------------------------- sessions
 
-pub async fn create_session(pool: &SqlitePool, token: &str, ttl_secs: i64) -> anyhow::Result<()> {
+pub async fn create_session(
+    pool: &SqlitePool,
+    token: &str,
+    ttl_secs: i64,
+    user_agent: Option<&str>,
+    address: Option<&str>,
+) -> anyhow::Result<()> {
     let now = now();
-    sqlx::query("INSERT INTO sessions (token, created, expires) VALUES (?, ?, ?)")
-        .bind(token)
-        .bind(now)
-        .bind(now + ttl_secs)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO sessions (token, created, expires, last_seen, user_agent, address)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(token)
+    .bind(now)
+    .bind(now + ttl_secs)
+    .bind(now)
+    .bind(user_agent)
+    .bind(address)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -317,6 +375,60 @@ pub async fn session_valid(pool: &SqlitePool, token: &str) -> bool {
     }
 }
 
+/// Note that a session was used, at a resolution of one minute.
+///
+/// The point of `last_seen` is to let you recognise a row in the session list
+/// — "this one was active a minute ago, that one three weeks ago". Minute
+/// resolution is plenty for that, and it turns a write on every single request
+/// into a write once a minute per session.
+pub async fn touch_session(pool: &SqlitePool, token: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE sessions SET last_seen = ?
+          WHERE token = ? AND (last_seen IS NULL OR last_seen < ?)",
+    )
+    .bind(now())
+    .bind(token)
+    .bind(now() - 60)
+    .execute(pool)
+    .await
+    {
+        tracing::debug!("could not update session activity: {e}");
+    }
+}
+
+/// Every live session, newest first. The tokens themselves never leave here.
+pub async fn list_sessions(
+    pool: &SqlitePool,
+    current_token: &str,
+) -> anyhow::Result<Vec<protect_api_types::SessionInfo>> {
+    let rows = sqlx::query(
+        "SELECT token, created, expires, last_seen, user_agent, address
+           FROM sessions WHERE expires > ? ORDER BY created DESC",
+    )
+    .bind(now())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let token: String = r.get("token");
+            let created: i64 = r.get("created");
+            protect_api_types::SessionInfo {
+                // A prefix, not the token: enough to tell two rows apart, and
+                // far too short to sign in with.
+                id: token.chars().take(8).collect(),
+                current: token == current_token,
+                created: created as f64,
+                expires: r.get::<i64, _>("expires") as f64,
+                last_seen: r.get::<Option<i64>, _>("last_seen").unwrap_or(created) as f64,
+                user_agent: r.get::<Option<String>, _>("user_agent"),
+                address: r.get::<Option<String>, _>("address"),
+            }
+        })
+        .collect())
+}
+
 pub async fn revoke_session(pool: &SqlitePool, token: &str) {
     if let Err(e) = sqlx::query("DELETE FROM sessions WHERE token = ?")
         .bind(token)
@@ -325,6 +437,23 @@ pub async fn revoke_session(pool: &SqlitePool, token: &str) {
     {
         tracing::error!("failed to revoke session: {e}");
     }
+}
+
+/// Sign out everywhere except here.
+///
+/// The one recovery action available with a single account: a session on a
+/// device you no longer have — a phone, a borrowed laptop — is otherwise valid
+/// for the full fourteen days, and changing the password does not touch it,
+/// because sessions are independent of the hash that created them.
+pub async fn revoke_other_sessions(pool: &SqlitePool, keep: &str) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM sessions WHERE token != ?")
+        .bind(keep)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() > 0 {
+        tracing::info!("revoked {} other session(s)", result.rows_affected());
+    }
+    Ok(result.rows_affected())
 }
 
 /// Drop expired sessions. Called at startup; cheap enough not to schedule.
@@ -382,15 +511,82 @@ mod tests {
     async fn sessions_expire_and_revoke() {
         let pool = pool("sessions").await;
 
-        create_session(&pool, "live", 3600).await.unwrap();
+        create_session(&pool, "live", 3600, None, None).await.unwrap();
         assert!(session_valid(&pool, "live").await);
 
-        create_session(&pool, "stale", -1).await.unwrap();
+        create_session(&pool, "stale", -1, None, None).await.unwrap();
         assert!(!session_valid(&pool, "stale").await);
 
         revoke_session(&pool, "live").await;
         assert!(!session_valid(&pool, "live").await);
 
         assert!(!session_valid(&pool, "never-existed").await);
+    }
+
+    #[tokio::test]
+    async fn the_session_list_describes_sessions_without_exposing_them() {
+        let pool = pool("session-list").await;
+        let token = "0123456789abcdef0123456789abcdef";
+
+        create_session(&pool, token, 3600, Some("Firefox on Linux"), Some("10.0.0.4"))
+            .await
+            .unwrap();
+        create_session(&pool, "other-token", 3600, None, None).await.unwrap();
+        create_session(&pool, "expired-token", -1, None, None).await.unwrap();
+
+        let list = list_sessions(&pool, token).await.unwrap();
+
+        // Expired sessions are not live sessions, so they are not listed.
+        assert_eq!(list.len(), 2);
+
+        let current = list.iter().find(|s| s.current).expect("one row is this session");
+        assert_eq!(current.user_agent.as_deref(), Some("Firefox on Linux"));
+        assert_eq!(current.address.as_deref(), Some("10.0.0.4"));
+
+        // The identifier must be useless for signing in.
+        assert_eq!(current.id, "01234567");
+        for s in &list {
+            assert!(s.id.len() <= 8, "an id long enough to be a token leaked");
+        }
+    }
+
+    #[tokio::test]
+    async fn signing_out_everywhere_keeps_the_session_doing_it() {
+        let pool = pool("revoke-others").await;
+        for token in ["here", "phone", "old-laptop"] {
+            create_session(&pool, token, 3600, None, None).await.unwrap();
+        }
+
+        assert_eq!(revoke_other_sessions(&pool, "here").await.unwrap(), 2);
+        assert!(session_valid(&pool, "here").await);
+        assert!(!session_valid(&pool, "phone").await);
+        assert!(!session_valid(&pool, "old-laptop").await);
+    }
+
+    #[tokio::test]
+    async fn activity_is_recorded_but_not_on_every_request() {
+        let pool = pool("touch").await;
+        create_session(&pool, "t", 3600, None, None).await.unwrap();
+
+        let seen_at = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT last_seen FROM sessions WHERE token = 't'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let before = seen_at(pool.clone()).await;
+
+        // A fresh session was just seen, so a request now must not write.
+        touch_session(&pool, "t").await;
+        assert_eq!(seen_at(pool.clone()).await, before);
+
+        // Backdated past the interval, it does.
+        sqlx::query("UPDATE sessions SET last_seen = ? WHERE token = 't'")
+            .bind(before - 3600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        touch_session(&pool, "t").await;
+        assert!(seen_at(pool).await >= before);
     }
 }
