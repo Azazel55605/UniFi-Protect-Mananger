@@ -30,9 +30,16 @@ export function ProgressBubble() {
   const failed = done && progress.status !== "Succeeded";
 
   return (
-    <div className="fixed right-6 bottom-6 z-20 flex flex-col items-end gap-2">
+    // Clear of the home indicator, and tucked closer to the corner on a phone
+    // where 24px of inset is a quarter of the free width.
+    <div
+      className="fixed right-4 bottom-4 z-20 flex flex-col items-end gap-2 md:right-6 md:bottom-6"
+      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+    >
       {open && (
-        <div className="glass-overlay w-80 rounded-[3px] border border-line p-3 shadow-xl">
+        // `w-80` is wider than a small phone's screen once the insets are
+        // taken off, so the panel is capped by the viewport instead.
+        <div className="glass-overlay w-[min(20rem,calc(100vw-2rem))] rounded-[3px] border border-line p-3 shadow-xl">
           <div className="mb-2 flex items-baseline justify-between">
             <span className="eyebrow">
               {progress.kind} · {progress.phase}

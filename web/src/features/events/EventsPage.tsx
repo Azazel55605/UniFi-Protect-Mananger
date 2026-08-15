@@ -166,14 +166,18 @@ function EventRow({ event }: { event: EventRecord }) {
   const when = new Date(event.start * 1000);
 
   return (
-    <li className="flex items-center gap-4 px-4 py-2.5 hover:bg-raised/40">
+    // Five fixed columns need more than 440px between them, so below `sm` the
+    // row becomes two lines rather than squeezing the camera name — which is
+    // the column that varies most and the one that gets crushed to nothing.
+    <li className="px-4 py-2.5 hover:bg-raised/40 @2xl:flex @2xl:items-center @2xl:gap-4">
+      <div className="flex items-center gap-3 @2xl:contents">
       <Tally state={status.tone} className="flex-none" />
 
       {/* 24-hour, always. An AM/PM suffix wraps the column and costs the
           camera name its space, and timecodes are what this kind of console
           deals in anyway. */}
       <time
-        className="data w-32 flex-none whitespace-nowrap text-fg-dim"
+        className="data flex-none whitespace-nowrap text-fg-dim @2xl:w-32"
         dateTime={when.toISOString()}
       >
         {when.toLocaleString(undefined, {
@@ -188,12 +192,12 @@ function EventRow({ event }: { event: EventRecord }) {
 
       {/* The camera name takes the slack, since names vary in length far more
           than anything else in the row. */}
-      <span className="min-w-0 flex-1 truncate text-sm">{event.camera}</span>
+      <span className="hidden min-w-0 flex-1 truncate text-sm @2xl:block">{event.camera}</span>
 
       {/* Detections get a fixed column so rows stay a uniform height. Most
           events have one; a few have two, and anything beyond that is
           summarised rather than clipped mid-word. */}
-      <span className="flex w-36 flex-none items-center gap-1.5 overflow-hidden">
+      <span className="ml-auto hidden w-36 flex-none items-center gap-1.5 overflow-hidden @2xl:flex">
         {event.subtypes.length > 0 ? (
           <>
             {event.subtypes.slice(0, 2).map((s) => (
@@ -218,19 +222,33 @@ function EventRow({ event }: { event: EventRecord }) {
         )}
       </span>
 
-      <span className="data w-16 flex-none text-right text-fg-faint">
+      <span className="data hidden w-16 flex-none text-right text-fg-faint @2xl:block">
         {formatDuration(event.duration)}
       </span>
 
       <span
         className={cn(
-          "data w-28 flex-none text-right text-[11px]",
+          "data hidden w-28 flex-none text-right text-[11px] @2xl:block",
           event.status === "Live" ? "text-fg-faint" : "text-fg-dim",
         )}
         title={status.hint}
       >
         {event.status === "Live" ? formatSize(event.size_bytes) : status.label}
       </span>
+      </div>
+
+      {/* Everything the columns carried, as one line, in the order you would
+          read it aloud. */}
+      <p className="mt-0.5 truncate pl-6 text-[11px] text-fg-dim @2xl:hidden">
+        {[
+          event.camera,
+          event.subtypes.join(", ") || event.event_type,
+          formatDuration(event.duration),
+          event.status === "Live" ? formatSize(event.size_bytes) : status.label,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+      </p>
     </li>
   );
 }
@@ -259,14 +277,16 @@ function Select({
   options: { value: string; label: string }[];
 }) {
   return (
-    <label className="flex flex-col gap-1">
+    // `min-w-[45%]` is what makes it two per row rather than four squeezed
+    // into one: a third cannot fit beside two of them, so it wraps.
+    <label className="flex min-w-[45%] flex-1 flex-col gap-1 @lg:min-w-0 @lg:flex-none">
       <span className="eyebrow">{label}</span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
         disabled={options.length === 0}
         className={cn(
-          "h-8 min-w-40 rounded-[3px] border border-line bg-ink/60 px-2 text-sm text-fg",
+          "h-8 w-full rounded-[3px] border border-line bg-ink/60 px-2 text-sm text-fg @lg:min-w-40",
           "disabled:opacity-40",
         )}
       >

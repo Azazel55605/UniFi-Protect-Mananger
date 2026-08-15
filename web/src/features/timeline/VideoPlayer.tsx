@@ -261,13 +261,21 @@ export function VideoPlayer({
           <Control label="Previous clip" onClick={onPrevious} disabled={!onPrevious}>
             <ChevronsLeft size={15} />
           </Control>
-          <Control label="Step back one frame" onClick={() => step(-1)}>
+          <Control
+            label="Step back one frame"
+            onClick={() => step(-1)}
+            className="hidden @lg:grid"
+          >
             <ChevronLeft size={15} />
           </Control>
           <Control label={playing ? "Pause" : "Play"} onClick={toggle} primary>
             {playing ? <Pause size={15} /> : <Play size={15} />}
           </Control>
-          <Control label="Step forward one frame" onClick={() => step(1)}>
+          <Control
+            label="Step forward one frame"
+            onClick={() => step(1)}
+            className="hidden @lg:grid"
+          >
             <ChevronRight size={15} />
           </Control>
           <Control label="Next clip" onClick={onNext} disabled={!onNext}>
@@ -298,6 +306,8 @@ export function VideoPlayer({
                 max={1}
                 step={0.05}
                 value={muted ? 0 : volume}
+                // Hidden on a phone, which has its own volume control and no
+                // room for a second one.
                 onChange={(e) => {
                   const v = Number(e.target.value);
                   setVolume(v);
@@ -305,7 +315,7 @@ export function VideoPlayer({
                   if (videoRef.current) videoRef.current.volume = v;
                 }}
                 aria-label="Volume"
-                className="h-1 w-16 accent-signal"
+                className="hidden h-1 w-16 accent-signal @lg:block"
               />
             </div>
 
@@ -327,12 +337,14 @@ function Control({
   onClick,
   disabled,
   primary,
+  className,
   children,
 }: {
   label: string;
   onClick?: () => void;
   disabled?: boolean;
   primary?: boolean;
+  className?: string;
   children: React.ReactNode;
 }) {
   return (
@@ -342,11 +354,14 @@ function Control({
       title={label}
       aria-label={label}
       className={cn(
-        "grid h-7 w-7 place-items-center rounded-[2px] transition-colors",
+        // Larger targets on touch, where 28px is below what a thumb can hit
+        // reliably; the desktop size is kept from `sm` up.
+        "grid h-9 w-9 place-items-center rounded-[2px] transition-colors @lg:h-7 @lg:w-7",
         primary
           ? "bg-signal text-signal-contrast hover:bg-signal/85"
           : "text-fg-dim hover:bg-raised hover:text-fg",
         disabled && "pointer-events-none opacity-30",
+        className,
       )}
     >
       {children}

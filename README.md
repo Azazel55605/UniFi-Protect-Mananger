@@ -67,6 +67,9 @@ storage on a schedule, and see whether the pipeline is actually working.
 - Classified errors: the app can tell "setup isn't finished" from "a job is
   already running" rather than guessing from a status code, and a server fault
   shows an id that appears verbatim in the container log
+- Works on a phone: navigation becomes a drawer, dense rows become two-line
+  entries, the day strip takes pinch and double-tap, and the app installs to a
+  home screen — no offline mode, because this is a live view of a remote system
 
 ## Running it
 
@@ -120,7 +123,7 @@ than showing an empty list.
 | ✅ | **Capacity dashboard** | Filesystem usage, growth over time, live vs archived split, per-camera breakdown |
 | ✅ | **Timeline and playback** | A day as a strip of marks, thumbnails, and inline playback — clips are HEVC, so they are transcoded on demand and cached |
 | ✅ | **Hardening** | Classified errors, request ids, sign-in backoff, session revocation, CI and published images |
-| ⬜ | **Mobile layouts** | Desktop-first for now; the timeline needs a different treatment on a phone |
+| ✅ | **Mobile layouts** | Drawer navigation, container-query layouts, pinch and double-tap on the timeline, installable as a web app |
 
 ## Configuration
 
@@ -239,6 +242,13 @@ response shape that breaks the frontend breaks `tsc` rather than surfacing as
 ## Why some of this looks the way it does
 
 A few decisions that are easy to mistake for accidents:
+
+- **Layouts respond to their container, not the window.** The one case that
+  breaks viewport breakpoints is not rare: at 768px the sidebar reappears and
+  takes 224px, so a "large" window hands its content barely 500px — and a table
+  that unpacked itself at a 640px *viewport* was then wider than the space it
+  sat in. The content column is a container query context, and the panels
+  inside measure themselves against it.
 
 - **Sign-in backoff is about CPU, not secrecy.** Verifying an argon2 hash is
   deliberately expensive, so an unthrottled login endpoint is an exhaustion

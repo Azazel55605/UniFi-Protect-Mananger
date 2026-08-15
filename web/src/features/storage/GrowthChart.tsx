@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { StorageSample } from "@/lib/types.gen";
 import { formatBytes } from "@/lib/format";
 
@@ -14,15 +14,46 @@ import { formatBytes } from "@/lib/format";
  * y-scale or a misleading comparison. It belongs in the capacity meters.
  */
 
-const W = 840;
-const H = 200;
-const PAD = { top: 12, right: 12, bottom: 22, left: 52 };
-
 type Point = { x: number; live: number; archive: number; at: number };
+
+/**
+ * The chart is drawn at its real size rather than scaled into place.
+ *
+ * A fixed 840-unit viewBox stretched to fit is fine for the curves and wrong
+ * for everything else: shrunk onto a phone, a 10px axis label lands at about
+ * four physical pixels and stops being a label. Measuring the container and
+ * drawing one SVG unit per CSS pixel keeps the type at the size it says.
+ */
+function useWidth(ref: React.RefObject<HTMLElement | null>) {
+  const [width, setWidth] = useState(840);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) setWidth(Math.max(280, entry.contentRect.width));
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+
+  return width;
+}
 
 export function GrowthChart({ samples }: { samples: StorageSample[] }) {
   const svgRef = useRef<SVGSVGElement>(null);
+  const boxRef = useRef<HTMLElement>(null);
   const [hover, setHover] = useState<number | null>(null);
+
+  const W = useWidth(boxRef);
+  const narrow = W < 520;
+  const H = narrow ? 150 : 200;
+  // The left gutter holds a byte label; it can be tighter when the numbers are
+  // shorter, but not so tight that "1.6 MB" runs into the plot.
+  const PAD = useMemo(
+    () => ({ top: 12, right: 12, bottom: 22, left: narrow ? 44 : 52 }),
+    [narrow],
+  );
 
   const model = useMemo(() => {
     if (samples.length < 2) return null;
@@ -62,11 +93,11 @@ export function GrowthChart({ samples }: { samples: StorageSample[] }) {
     const archiveLine = line(archiveCurve);
 
     return { points, peak, y, archiveArea, liveBand, totalLine, archiveLine, t0, t1 };
-  }, [samples]);
+  }, [samples, W, H, PAD]);
 
   if (!model) {
     return (
-      <p className="py-8 text-center text-sm text-fg-dim">
+      <p ref={boxRef as React.RefObject<HTMLParagraphElement>} className="py-8 text-center text-sm text-fg-dim">
         Not enough history yet. Usage is recorded every half hour, so the trend
         appears after the first day.
       </p>
@@ -93,10 +124,12 @@ export function GrowthChart({ samples }: { samples: StorageSample[] }) {
     setHover(best);
   };
 
-  const gridValues = [0.25, 0.5, 0.75, 1].map((f) => f * model.peak);
+  // Four gridlines crowd a 150px-tall plot into stripes; two are enough to
+  // read a value off.
+  const gridValues = (narrow ? [0.5, 1] : [0.25, 0.5, 0.75, 1]).map((f) => f * model.peak);
 
   return (
-    <figure className="m-0">
+    <figure ref={boxRef as React.RefObject<HTMLElement>} className="m-0">
       <svg
         ref={svgRef}
         viewBox={`0 0 ${W} ${H}`}

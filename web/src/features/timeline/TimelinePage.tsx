@@ -151,7 +151,7 @@ export function TimelinePage() {
           <select
             value={camera ?? ""}
             onChange={(e) => setCamera(e.target.value || undefined)}
-            className="h-8 min-w-40 rounded-[3px] border border-line bg-ink/60 px-2 text-sm text-fg"
+            className="h-8 min-w-40 flex-1 rounded-[3px] border border-line bg-ink/60 px-2 text-sm text-fg @lg:flex-none"
             aria-label="Camera"
           >
             <option value="">All cameras</option>
@@ -166,7 +166,7 @@ export function TimelinePage() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search camera, detection or time"
-            className="h-8 w-64"
+            className="h-8 w-full @lg:w-64"
             aria-label="Search clips"
           />
 
@@ -257,19 +257,136 @@ export function TimelinePage() {
             </p>
           </PanelBody>
         ) : (
-          <PanelBody className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {ordered.map((e) => (
-              <ClipTile
-                key={e.id}
-                event={e}
-                active={selected?.id === e.id}
-                onSelect={() => select(e)}
-              />
-            ))}
-          </PanelBody>
+          <>
+            {/* Two layouts, because the same one cannot serve both. A grid of
+                tiles is the right way to scan a day on a desktop; at 390px it
+                gives 180px cells in which every camera name truncates to
+                "Fro…". So a phone gets rows — thumbnail beside the details,
+                grouped by hour so a long scroll has landmarks. */}
+            <PanelBody className="hidden grid-cols-2 gap-3 @lg:grid @xl:grid-cols-3 @4xl:grid-cols-4">
+              {ordered.map((e) => (
+                <ClipTile
+                  key={e.id}
+                  event={e}
+                  active={selected?.id === e.id}
+                  onSelect={() => select(e)}
+                />
+              ))}
+            </PanelBody>
+
+            <div className="@lg:hidden">
+              {byHour(ordered).map(([hour, clips]) => (
+                <section key={hour}>
+                  <h3 className="data sticky top-0 z-10 border-y border-line bg-raised/80 px-4 py-1 text-[11px] text-fg-dim backdrop-blur-sm">
+                    {hour}
+                    <span className="ml-2 text-fg-faint">
+                      {clips.length} clip{clips.length === 1 ? "" : "s"}
+                    </span>
+                  </h3>
+                  <ul className="divide-y divide-line">
+                    {clips.map((e) => (
+                      <ClipRow
+                        key={e.id}
+                        event={e}
+                        active={selected?.id === e.id}
+                        onSelect={() => select(e)}
+                      />
+                    ))}
+                  </ul>
+                </section>
+              ))}
+            </div>
+          </>
         )}
       </Panel>
     </div>
+  );
+}
+
+/**
+ * Group clips by the hour they start in, preserving the order given.
+ *
+ * A busy day is a hundred rows on a phone, and an undifferentiated scroll of
+ * thumbnails gives you nothing to hold on to. The hour is the coarsest label
+ * that still tells you where you are.
+ */
+function byHour(events: EventRecord[]): [string, EventRecord[]][] {
+  const groups = new Map<string, EventRecord[]>();
+  for (const e of events) {
+    const label = new Date(e.start * 1000).toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+    // Truncated to the hour by replacing the minutes, which keeps whatever
+    // 24-hour formatting the locale produced rather than rebuilding it.
+    const key = `${label.slice(0, 2)}:00`;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(e);
+    else groups.set(key, [e]);
+  }
+  return [...groups.entries()];
+}
+
+/**
+ * One clip as a row: thumbnail, then everything that was too long to fit on a
+ * tile. Sized for a thumb — the whole row is the target, not a 12px label.
+ */
+function ClipRow({
+  event,
+  active,
+  onSelect,
+}: {
+  event: EventRecord;
+  active: boolean;
+  onSelect: () => void;
+}) {
+  const live = event.status === "Live";
+  const detections = event.subtypes.join(", ") || event.event_type;
+
+  return (
+    <li>
+      <button
+        onClick={live ? onSelect : undefined}
+        disabled={!live}
+        className={cn(
+          "flex w-full items-center gap-3 px-4 py-2.5 text-left",
+          active && "bg-raised",
+          !live && "opacity-60",
+        )}
+      >
+        <div className="relative aspect-video w-28 flex-none overflow-hidden rounded-[2px] bg-ink-deep">
+          {live ? (
+            <img
+              src={`/api/media/${encodeURIComponent(event.id)}/thumb`}
+              alt=""
+              loading="lazy"
+              className="h-full w-full object-cover"
+            />
+          ) : (
+            <span className="data absolute inset-0 grid place-items-center text-[10px] text-fg-faint">
+              {event.status === "Archived" ? "in archive" : "no clip"}
+            </span>
+          )}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline gap-2">
+            <span className="data text-sm text-fg">{clock(event.start)}</span>
+            <span className="data text-[11px] text-fg-faint">
+              {formatDuration(event.duration)}
+            </span>
+          </div>
+          <p className="truncate text-sm text-fg-dim">{event.camera}</p>
+          <p className="truncate text-[11px] text-fg-faint">
+            {detections}
+            {event.size_bytes != null && ` · ${formatBytes(event.size_bytes)}`}
+          </p>
+        </div>
+
+        {active && <span className="tally bg-signal" aria-hidden />}
+      </button>
+    </li>
   );
 }
 

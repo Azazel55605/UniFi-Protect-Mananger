@@ -328,10 +328,14 @@ export function SettingsSummary() {
       <PanelHeader label="Configuration" />
       <PanelBody className="space-y-2.5">
         {rows.map((c) => (
+          // Stacked on a phone: these details are mostly filesystem paths, and
+          // a fixed label column leaves them a dozen characters wide.
           <div key={c.name} className="flex items-start gap-3">
             <Tally state={c.ok ? "ok" : "bad"} className="mt-1.5" />
-            <span className="w-32 flex-none text-sm text-fg-dim">{c.name}</span>
-            <span className="data min-w-0 flex-1 break-all">{c.detail}</span>
+            <div className="min-w-0 flex-1 @lg:flex @lg:items-start @lg:gap-3">
+              <span className="block text-sm text-fg-dim @lg:w-32 @lg:flex-none">{c.name}</span>
+              <span className="data block min-w-0 break-all @lg:flex-1">{c.detail}</span>
+            </div>
           </div>
         ))}
       </PanelBody>

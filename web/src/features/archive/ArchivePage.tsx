@@ -178,9 +178,9 @@ export function ArchivePage() {
         ) : (
           <ul className="divide-y divide-line">
             {runs.data?.slice(0, 12).map((r) => (
-              <li key={r.id} className="flex items-center gap-3 px-4 py-2.5">
+              <li key={r.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2.5">
                 <Tally state={runTone(r.status)} className="flex-none" />
-                <span className="data w-32 flex-none text-fg-dim">
+                <span className="data flex-none text-fg-dim @xl:w-32">
                   {new Date(r.started * 1000).toLocaleString(undefined, {
                     month: "short",
                     day: "2-digit",
@@ -195,7 +195,9 @@ export function ArchivePage() {
                 <span className="data w-16 flex-none text-[11px] text-fg-faint">
                   {r.dry_run ? "dry run" : r.scheduled ? "scheduled" : "manual"}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-sm text-fg-dim">
+                {/* `basis-full` on a phone: the message is a sentence, and a
+                    sentence sharing a line with four labels is a fragment. */}
+                <span className="min-w-0 basis-full truncate text-sm text-fg-dim @xl:flex-1 @xl:basis-auto">
                   {r.message ?? "—"}
                 </span>
                 {r.failed_files.length > 0 && (
@@ -329,12 +331,16 @@ function CameraGroup({
         className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-raised/40"
       >
         <span className="data w-3 flex-none text-fg-faint">{open ? "−" : "+"}</span>
-        <span className="flex-1 truncate text-sm font-medium">{camera}</span>
-        <span className="data text-[11px] text-fg-faint">{span}</span>
-        <span className="data w-28 text-right text-fg-dim">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium">{camera}</span>
+        {/* The month range is the first thing to go: it is the only column
+            here that repeats what opening the group would show anyway. */}
+        <span className="data hidden text-[11px] text-fg-faint @xl:inline">{span}</span>
+        <span className="data w-20 flex-none text-right text-fg-dim @xl:w-28">
           {entries.length} {entries.length === 1 ? "month" : "months"}
         </span>
-        <span className="data w-24 text-right text-fg-faint">{formatBytes(bytes)}</span>
+        <span className="data w-20 flex-none text-right text-fg-faint @xl:w-24">
+          {formatBytes(bytes)}
+        </span>
       </button>
 
       {open && (
@@ -374,7 +380,11 @@ function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
 
   return (
     <li className="px-4 py-2.5">
-      <div className="flex items-center gap-3">
+      {/* The two actions are pushed onto their own line below `sm`: side by
+          side with the month and size they need about 420px, and what gets
+          pushed off the edge is Restore — the one action you would be looking
+          for on a phone in the first place. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <Tally
           state={entry.verify_ok === false ? "bad" : entry.verify_ok ? "ok" : "idle"}
           className="flex-none"
@@ -401,6 +411,10 @@ function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
           </button>
         )}
 
+        {/* `ml-auto` on a wrapped line puts the buttons at the right of their
+            own row; on one line it does nothing, because the truncating file
+            count has already taken the slack. */}
+        <div className="ml-auto flex flex-none items-center gap-2">
         <Button size="sm" variant="ghost" disabled={busy} onClick={() => verify.mutate()}>
           Verify
         </Button>
@@ -424,6 +438,7 @@ function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
             Restore
           </Button>
         )}
+        </div>
       </div>
 
       {confirming && (

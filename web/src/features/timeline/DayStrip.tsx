@@ -14,8 +14,15 @@ import type { EventRecord } from "@/lib/types.gen";
 const DAY = 86_400;
 /** Half a minute across the strip is as far in as this is useful. */
 const MIN_SPAN = 30;
-/** Grab area for the window's edges, in pixels. */
+/**
+ * Grab area for the window's edges, in pixels.
+ *
+ * Wider for touch: a fingertip is about 9mm across and lands with far less
+ * precision than a cursor, so a 10px target that is comfortable with a mouse
+ * is a coin toss with a thumb.
+ */
 const HANDLE = 10;
+const TOUCH_HANDLE = 22;
 
 export type View = { start: number; end: number };
 
@@ -44,6 +51,18 @@ export function DayStrip({
   const stripRef = useRef<HTMLDivElement>(null);
   const overviewRef = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
+
+  // Live pointers on the detail strip, by id. One is a pan; two is a pinch.
+  const pointers = useRef(new Map<number, number>());
+  const pinch = useRef<{
+    distance: number;
+    span: number;
+    /** Where between the strip's edges the fingers are centred, 0–1. */
+    anchor: number;
+    /** The instant under that point when the gesture began. */
+    anchorTime: number;
+  } | null>(null);
+  const lastTap = useRef(0);
 
   const dayEnd = dayStart + DAY;
   const span = view.end - view.start;
@@ -96,6 +115,110 @@ export function DayStrip({
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
+  /** Seconds at a client x position on the detail strip. */
+  const timeInStrip = useCallback(
+    (clientX: number) => {
+      const rect = stripRef.current?.getBoundingClientRect();
+      if (!rect) return view.start;
+      return view.start + ((clientX - rect.left) / rect.width) * span;
+    },
+    [view.start, span],
+  );
+
+  /**
+   * Zoom about a fixed point, keeping whatever is under it in place.
+   *
+   * The anchor is what makes zooming feel like the strip rather than a
+   * scrollbar: the moment you zoom toward 14:30 and land at 09:00, you have
+   * lost the thing you were looking at.
+   */
+  const zoomAround = useCallback(
+    (anchorTime: number, anchorRatio: number, width: number) => {
+      const w = Math.min(DAY, Math.max(MIN_SPAN, width));
+      onViewChange(clamp({ start: anchorTime - anchorRatio * w, end: anchorTime - anchorRatio * w + w }));
+    },
+    [clamp, onViewChange],
+  );
+
+  /**
+   * Pinch to zoom, and a double tap to step in.
+   *
+   * A wheel is the desktop gesture and a phone has none, so without these the
+   * strip is fixed at a whole day on the device where a whole day is hardest
+   * to read. The pointer events are the same ones the pan uses; what separates
+   * the two is simply how many are down.
+   */
+  const onStripPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    pointers.current.set(e.pointerId, e.clientX);
+    capture(e);
+
+    if (pointers.current.size === 2) {
+      const [a, b] = [...pointers.current.values()];
+      // A pan already in progress is abandoned rather than blended with the
+      // pinch, which would make the strip lurch as the second finger lands.
+      drag.current = null;
+      const rect = stripRef.current?.getBoundingClientRect();
+      const mid = (a! + b!) / 2;
+      const anchor = rect ? (mid - rect.left) / rect.width : 0.5;
+      pinch.current = {
+        distance: Math.max(1, Math.abs(a! - b!)),
+        span,
+        anchor,
+        // Fixed at the start of the gesture. Recomputing it from the current
+        // view on every move would feed the zoom back into its own anchor and
+        // the strip would crawl sideways as you pinch.
+        anchorTime: view.start + anchor * span,
+      };
+      return;
+    }
+
+    if (pointers.current.size > 2) return;
+
+    const now = performance.now();
+    if (now - lastTap.current < 300) {
+      // Double tap: in by half, about the point tapped. The gesture every
+      // map on a phone uses, for the same reason.
+      lastTap.current = 0;
+      zoomAround(timeInStrip(e.clientX), 0.5, span / 2);
+      return;
+    }
+    lastTap.current = now;
+
+    if (!zoomed) return;
+    drag.current = { mode: "pan", x: e.clientX, start: view.start };
+  };
+
+  const onStripPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (pointers.current.has(e.pointerId)) {
+      pointers.current.set(e.pointerId, e.clientX);
+    }
+
+    const p = pinch.current;
+    if (p && pointers.current.size >= 2) {
+      const [a, b] = [...pointers.current.values()];
+      const distance = Math.max(1, Math.abs(a! - b!));
+      // Fingers apart means zoom in, which means a shorter span.
+      zoomAround(p.anchorTime, p.anchor, p.span * (p.distance / distance));
+      return;
+    }
+
+    const d = drag.current;
+    if (d?.mode !== "pan") return;
+    const rect = stripRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const shift = ((e.clientX - d.x) / rect.width) * span;
+    onViewChange(clamp({ start: d.start - shift, end: d.start - shift + span }));
+  };
+
+  const onStripPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
+    // The finger left over after a pinch must not become a pan of its own:
+    // it has been stationary in the gesture's frame, so any movement since is
+    // meaningless.
+    if (pointers.current.size === 0) drag.current = null;
+  };
+
   const marks = useMemo(
     () =>
       events
@@ -124,11 +247,16 @@ export function DayStrip({
 
     capture(e);
 
+    // `pointerType` is what the browser knows about the thing that touched the
+    // screen, which is more reliable than guessing from viewport width — a
+    // touchscreen laptop is wide and still deserves the larger target.
+    const handle = e.pointerType === "mouse" ? HANDLE : TOUCH_HANDLE;
+
     // Edges take priority over the body, so a narrow window is still
     // resizable rather than only movable.
-    if (Math.abs(e.clientX - leftPx) <= HANDLE) {
+    if (Math.abs(e.clientX - leftPx) <= handle) {
       drag.current = { mode: "start", end: view.end };
-    } else if (Math.abs(e.clientX - rightPx) <= HANDLE) {
+    } else if (Math.abs(e.clientX - rightPx) <= handle) {
       drag.current = { mode: "end", start: view.start };
     } else if (e.clientX > leftPx && e.clientX < rightPx) {
       drag.current = { mode: "move", x: e.clientX, start: view.start, span };
@@ -169,26 +297,18 @@ export function DayStrip({
       {/* Detail strip */}
       <div
         ref={stripRef}
-        onPointerDown={(e) => {
-          if (!zoomed) return;
-          drag.current = { mode: "pan", x: e.clientX, start: view.start };
-          capture(e);
-        }}
-        onPointerMove={(e) => {
-          const d = drag.current;
-          if (d?.mode !== "pan") return;
-          const rect = stripRef.current?.getBoundingClientRect();
-          if (!rect) return;
-          const shift = ((e.clientX - d.x) / rect.width) * span;
-          onViewChange(clamp({ start: d.start - shift, end: d.start - shift + span }));
-        }}
-        onPointerUp={endDrag}
-        onPointerLeave={() => {
-          endDrag();
+        onPointerDown={onStripPointerDown}
+        onPointerMove={onStripPointerMove}
+        onPointerUp={onStripPointerUp}
+        onPointerCancel={onStripPointerUp}
+        onPointerLeave={(e) => {
+          onStripPointerUp(e);
           setHover(null);
         }}
         className={cn(
-          "relative h-20 w-full touch-none overflow-hidden rounded-[3px] bg-ink-deep",
+          // Taller on a phone: the marks are the whole point and a thumb has
+          // to be able to hit one.
+          "relative h-24 w-full touch-none overflow-hidden rounded-[3px] bg-ink-deep @lg:h-20",
           zoomed ? "cursor-grab active:cursor-grabbing" : "cursor-default",
         )}
       >
@@ -238,7 +358,7 @@ export function DayStrip({
           onPointerMove={onOverviewMove}
           onPointerUp={endDrag}
           onPointerCancel={endDrag}
-          className="relative mt-1.5 h-7 w-full touch-none overflow-hidden rounded-[2px] bg-ink-deep/60"
+          className="relative mt-1.5 h-10 w-full touch-none overflow-hidden rounded-[2px] bg-ink-deep/60 @lg:h-7"
           title="Drag the window to move it, or its edges to resize"
         >
           {events.map((e) => (
@@ -272,14 +392,26 @@ export function DayStrip({
               "00:00" and reads as an empty range. */}
           {zoomed ? `${clockOf(view.start)} – ${clockOf(view.end)}` : "00:00 – 24:00"}
         </span>
+        {/* The instructions differ by input device, so each is shown only
+            where it is true: telling someone on a phone to scroll to zoom is
+            worse than saying nothing. */}
         <span className="data flex-1 truncate text-[11px] text-fg-dim">
-          {hover
-            ? `${clockOf(hover.start)} · ${hover.camera} · ${
-                hover.subtypes.join(", ") || hover.event_type
-              } · ${Math.round(hover.duration)}s`
-            : zoomed
-              ? "drag to pan · scroll to zoom · drag the window below to move or resize"
-              : "scroll to zoom in"}
+          {hover ? (
+            `${clockOf(hover.start)} · ${hover.camera} · ${
+              hover.subtypes.join(", ") || hover.event_type
+            } · ${Math.round(hover.duration)}s`
+          ) : (
+            <>
+              <span className="hidden @lg:inline">
+                {zoomed
+                  ? "drag to pan · scroll to zoom · drag the window below to move or resize"
+                  : "scroll to zoom in"}
+              </span>
+              <span className="@lg:hidden">
+                {zoomed ? "drag to pan · pinch to zoom" : "pinch or double-tap to zoom in"}
+              </span>
+            </>
+          )}
         </span>
       </div>
     </div>

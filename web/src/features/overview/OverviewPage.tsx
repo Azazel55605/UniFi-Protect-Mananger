@@ -45,7 +45,7 @@ export function OverviewPage() {
   ];
 
   return (
-    <div className="grid max-w-5xl gap-4 lg:grid-cols-2">
+    <div className="grid max-w-5xl gap-4 @4xl:grid-cols-2">
       <Panel className="lg:col-span-2">
         <PanelHeader
           label="Pipeline"
@@ -63,12 +63,17 @@ export function OverviewPage() {
         />
         <PanelBody className="space-y-3">
           {checks.map(([label, check]) => (
+            // Stacked on a phone: a fixed label column plus a path leaves the
+            // detail about twelve characters wide, which turns a mount point
+            // into a ragged column of fragments.
             <div key={label} className="flex items-start gap-3">
               <Tally state={check ? (check.ok ? "ok" : "bad") : "idle"} className="mt-1.5" />
-              <span className="w-36 flex-none text-sm">{label}</span>
-              <span className="data min-w-0 flex-1 break-all text-fg-dim">
-                {check?.detail ?? "checking…"}
-              </span>
+              <div className="min-w-0 flex-1 @lg:flex @lg:items-start @lg:gap-3">
+                <span className="block text-sm @lg:w-36 @lg:flex-none">{label}</span>
+                <span className="data block min-w-0 break-all text-fg-dim @lg:flex-1">
+                  {check?.detail ?? "checking…"}
+                </span>
+              </div>
             </div>
           ))}
         </PanelBody>
@@ -107,7 +112,7 @@ export function OverviewPage() {
       {index.data && index.data.stats.total_events > 0 && (
         <Panel className="lg:col-span-2">
           <PanelHeader label="Footage" aside={<SyncAge stats={index.data.stats} />} />
-          <PanelBody className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+          <PanelBody className="grid grid-cols-2 gap-4 @xl:grid-cols-3 @4xl:grid-cols-5">
             <Stat
               label="Last captured"
               value={formatLag(index.data.stats.backup_lag_secs)}
@@ -248,9 +253,9 @@ function Stat({
 
 function Row({ k, v }: { k: string; v: string }) {
   return (
-    <div className="flex gap-3">
-      <dt className="eyebrow w-32 flex-none pt-0.5">{k}</dt>
-      <dd className="data min-w-0 flex-1 break-all">{v}</dd>
+    <div className="@lg:flex @lg:gap-3">
+      <dt className="eyebrow pt-0.5 @lg:w-32 @lg:flex-none">{k}</dt>
+      <dd className="data min-w-0 break-all @lg:flex-1">{v}</dd>
     </div>
   );
 }

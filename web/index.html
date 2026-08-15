@@ -2,8 +2,26 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- `viewport-fit=cover` lets the page reach under the notch and the home
+         indicator; the shell puts the safe-area insets back where they matter.
+         Zoom is deliberately left enabled — pinch-to-zoom is an accessibility
+         feature, and the one place this app wants a pinch of its own (the day
+         strip) claims the gesture itself with `touch-action: none`. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>protect-manager</title>
+
+    <!-- Installable, but not offline: this is a live view of a remote system,
+         and a cached copy of it would be a picture of the past presented as
+         the present. No service worker, therefore, and no offline support. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <meta name="apple-mobile-web-app-title" content="Protect" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <!-- Matched to each theme's page background so the browser chrome and the
+         status bar blend into the app rather than framing it. -->
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0f14" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#eef1f5" />
     <script>
       // Applied before first paint. Without this the page renders in the
       // default palette for a frame and then snaps to the stored one, which

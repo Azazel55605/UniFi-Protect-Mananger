@@ -63,7 +63,7 @@ export function CapacityPage() {
         </PanelBody>
       </Panel>
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 @2xl:grid-cols-3">
         <Stat label="Footage held" value={formatBytes(totalFootage)} />
         <Stat
           label="Growing by"
@@ -108,11 +108,14 @@ export function CapacityPage() {
           </PanelBody>
         ) : (
           <div>
+            {/* The numeric columns need 350px of fixed width between them; on
+                a phone that leaves nothing for the camera name, so the header
+                loses the two columns that move into each row instead. */}
             <div className="flex items-center gap-3 border-b border-line px-4 py-2">
               <span className="eyebrow flex-1">Camera</span>
-              <span className="eyebrow w-24 text-right">Live</span>
-              <span className="eyebrow w-24 text-right">Archived</span>
-              <span className="eyebrow w-40 text-right">Share</span>
+              <span className="eyebrow hidden w-24 text-right @xl:block">Live</span>
+              <span className="eyebrow hidden w-24 text-right @xl:block">Archived</span>
+              <span className="eyebrow w-28 text-right @xl:w-40">Share</span>
             </div>
             <ul className="divide-y divide-line">
               {s?.cameras.map((c) => (
@@ -166,15 +169,16 @@ function CameraRow({ usage, total }: { usage: CameraUsage; total: number }) {
   const livePart = sum > 0 ? (usage.live_bytes / sum) * 100 : 0;
 
   return (
-    <li className="flex items-center gap-3 px-4 py-2.5">
+    <li className="px-4 py-2.5">
+      <div className="flex items-center gap-3">
       <span className="min-w-0 flex-1 truncate text-sm">{usage.camera}</span>
-      <span className="data w-24 text-right text-fg-dim">
+      <span className="data hidden w-24 text-right text-fg-dim @xl:block">
         {usage.live_bytes > 0 ? formatBytes(usage.live_bytes) : "—"}
       </span>
-      <span className="data w-24 text-right text-fg-dim">
+      <span className="data hidden w-24 text-right text-fg-dim @xl:block">
         {usage.archive_bytes > 0 ? formatBytes(usage.archive_bytes) : "—"}
       </span>
-      <span className="flex w-40 items-center gap-2">
+      <span className="flex w-28 items-center gap-2 @xl:w-40">
         {/* The same two series colours as the chart, so live and archived mean
             the same thing wherever they appear. */}
         <span className="flex h-2 flex-1 overflow-hidden rounded-[2px] bg-raised">
@@ -195,6 +199,15 @@ function CameraRow({ usage, total }: { usage: CameraUsage; total: number }) {
           {Math.round(share)}%
         </span>
       </span>
+      </div>
+
+      {/* The same two numbers, as a caption, where there is no room for
+          columns. */}
+      <p className="data mt-0.5 text-[11px] text-fg-faint @xl:hidden">
+        {usage.live_bytes > 0 ? formatBytes(usage.live_bytes) : "no"} live
+        {" · "}
+        {usage.archive_bytes > 0 ? `${formatBytes(usage.archive_bytes)} archived` : "none archived"}
+      </p>
     </li>
   );
 }

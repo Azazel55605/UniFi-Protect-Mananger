@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "protect-api-types"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "ts-rs",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "protect-manager"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "argon2",
