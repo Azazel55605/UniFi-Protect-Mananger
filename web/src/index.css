@@ -244,18 +244,23 @@
 @layer components {
   /* Frosted surfaces. The alpha differs per theme: a light theme needs more
      opacity to keep small text legible over the wash, a dark one can afford
-     to let more through. */
+     to let more through.
+     
+     Note the declaration order: the prefixed property comes first and the
+     standard one last. Minifiers collapse the pair and keep the later of the
+     two, and Firefox implements only the unprefixed form — reversed, the blur
+     silently disappears there. */
   .glass {
     background: color-mix(in srgb, var(--panel) var(--glass), transparent);
-    backdrop-filter: blur(14px) saturate(1.3);
     -webkit-backdrop-filter: blur(14px) saturate(1.3);
+    backdrop-filter: blur(14px) saturate(1.3);
     box-shadow: var(--panel-shadow);
   }
 
   .glass-chrome {
     background: color-mix(in srgb, var(--panel) calc(var(--glass) - 12%), transparent);
-    backdrop-filter: blur(20px) saturate(1.4);
     -webkit-backdrop-filter: blur(20px) saturate(1.4);
+    backdrop-filter: blur(20px) saturate(1.4);
   }
 
   /* Overlays sit on top of content rather than on the page background, so
@@ -263,8 +268,8 @@
      text underneath shows straight through and neither layer is readable. */
   .glass-overlay {
     background: color-mix(in srgb, var(--panel) 97%, transparent);
-    backdrop-filter: blur(20px) saturate(1.3);
-    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    -webkit-backdrop-filter: blur(24px) saturate(1.4);
+    backdrop-filter: blur(24px) saturate(1.4);
   }
 
   /* Long-form monospace stays fully opaque. Blurred backgrounds under dense

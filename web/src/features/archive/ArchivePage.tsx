@@ -69,12 +69,19 @@ export function ArchivePage() {
           label="Ready to archive"
           aside={
             <div className="flex items-center gap-2">
+              {/* Deliberately not disabled when nothing is due: with nothing
+                  due the server previews the oldest month instead, which is
+                  exactly when you want to test that archiving works. */}
               <Button
                 size="sm"
                 variant="ghost"
-                disabled={busy || due.length === 0}
+                disabled={busy}
                 onClick={() => start.mutate(true)}
-                title="Report what would happen without writing or deleting anything"
+                title={
+                  due.length === 0
+                    ? "Nothing is due, so this previews the oldest month. Writes and deletes nothing."
+                    : "Report what would happen without writing or deleting anything"
+                }
               >
                 Dry run
               </Button>
