@@ -99,7 +99,11 @@ export type ClipInfo = { id: string, available: boolean,
 /**
  * Why it isn't, when it isn't.
  */
-reason: string | null, codec: string | null, 
+reason: string | null, codec: string | null, width: number | null, height: number | null, 
+/**
+ * Size of the recording itself, not of any transcode.
+ */
+size_bytes: number | null, 
 /**
  * True when the browser can play the recording as-is.
  */

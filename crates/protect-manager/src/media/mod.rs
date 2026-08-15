@@ -54,14 +54,17 @@ impl Media {
         dest.with_file_name(format!("{stem}.partial.{ext}"))
     }
 
-    /// The video codec of a clip, as ffprobe reports it.
-    pub async fn probe_codec(&self, source: &Path) -> anyhow::Result<String> {
+    /// What a clip's video stream is: codec and dimensions.
+    ///
+    /// One ffprobe call for all three, because spawning the process dominates
+    /// the cost and asking twice would double it for no reason.
+    pub async fn probe(&self, source: &Path) -> anyhow::Result<VideoInfo> {
         let out = Command::new("ffprobe")
             .args([
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=nw=1:nk=1",
+                "-show_entries", "stream=codec_name,width,height",
+                "-of", "csv=p=0:nk=1",
             ])
             .arg(source)
             .stdout(Stdio::piped())
@@ -72,7 +75,18 @@ impl Media {
         if !out.status.success() {
             anyhow::bail!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_lowercase())
+
+        let line = String::from_utf8_lossy(&out.stdout);
+        let mut parts = line.trim().split(',');
+        Ok(VideoInfo {
+            codec: parts.next().unwrap_or_default().trim().to_lowercase(),
+            width: parts.next().and_then(|v| v.trim().parse().ok()),
+            height: parts.next().and_then(|v| v.trim().parse().ok()),
+        })
+    }
+
+    pub async fn probe_codec(&self, source: &Path) -> anyhow::Result<String> {
+        Ok(self.probe(source).await?.codec)
     }
 
     pub fn browser_can_play(codec: &str) -> bool {
@@ -201,6 +215,13 @@ impl Media {
         }
         removed
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VideoInfo {
+    pub codec: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
 }
 
 pub struct PlayableClip {

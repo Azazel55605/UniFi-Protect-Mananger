@@ -1019,6 +1019,9 @@ async fn clip_info_handler(
                 available: false,
                 reason: Some(reason),
                 codec: None,
+                width: None,
+                height: None,
+                size_bytes: None,
                 direct: false,
                 prepared: false,
             })
@@ -1026,13 +1029,21 @@ async fn clip_info_handler(
         }
     };
 
-    let codec = state.media.probe_codec(&path).await.ok();
-    let direct = codec.as_deref().map(media::Media::browser_can_play).unwrap_or(false);
+    let probed = state.media.probe(&path).await.ok();
+    let direct = probed
+        .as_ref()
+        .map(|p| media::Media::browser_can_play(&p.codec))
+        .unwrap_or(false);
+    let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len() as i64);
+
     Json(ClipInfo {
         prepared: direct || state.media.is_prepared(&id),
         available: true,
         reason: None,
-        codec,
+        codec: probed.as_ref().map(|p| p.codec.clone()),
+        width: probed.as_ref().and_then(|p| p.width),
+        height: probed.as_ref().and_then(|p| p.height),
+        size_bytes,
         direct,
         id,
     })

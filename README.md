@@ -41,8 +41,9 @@ storage on a schedule, and see whether the pipeline is actually working.
   pin you to one screen
 - Capacity: filesystem usage, how fast footage is growing, roughly how long the
   space lasts, and where it is going per camera
-- A timeline of any day as a strip of marks, with thumbnails and inline
-  playback; the original recording is always downloadable untouched
+- A timeline of any day as a strip of marks that zooms down to seconds, with
+  search, sorting, thumbnails and inline playback; selecting a clip zooms the
+  strip to it, and the original recording is always downloadable untouched
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 

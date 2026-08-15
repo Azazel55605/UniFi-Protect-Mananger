@@ -556,6 +556,13 @@ pub struct ClipInfo {
     /// Why it isn't, when it isn't.
     pub reason: Option<String>,
     pub codec: Option<String>,
+    #[ts(type = "number | null")]
+    pub width: Option<i64>,
+    #[ts(type = "number | null")]
+    pub height: Option<i64>,
+    /// Size of the recording itself, not of any transcode.
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<i64>,
     /// True when the browser can play the recording as-is.
     pub direct: bool,
     /// True when a transcode already exists, so playback starts immediately.
