@@ -60,6 +60,12 @@
   --live: #0d9488;
 
   --accent-strong: color-mix(in oklab, var(--accent) 72%, #2a1c00);
+  /* Chart series. Fixed across themes and accents — validated for CVD
+     separation against both the light and dark chart surfaces (ΔE 30 protan,
+     29 tritan), and deliberately independent of the user's accent, which
+     could otherwise collide with one of the two. */
+  --chart-live: #3b82f6;
+  --chart-archive: #d97706;
   --glass: 82%;
   --ambient: 0.28;
   /* Light panels are near-white on near-white, so they need a shadow to read

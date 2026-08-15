@@ -39,6 +39,8 @@ storage on a schedule, and see whether the pipeline is actually working.
   and restore
 - A running job stays visible from any page, so archiving a few months doesn't
   pin you to one screen
+- Capacity: filesystem usage, how fast footage is growing, roughly how long the
+  space lasts, and where it is going per camera
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 
@@ -91,7 +93,7 @@ than showing an empty list.
 | ✅ | **Shell, setup and health** | Login, interactive setup, health checks, live container logs |
 | ✅ | **Event feed** | Indexes the backup service's event database, reads camera names and detection types out of clip filenames, filters by camera, type, detection and clip state |
 | ✅ | **Archiving** | Packs old clips into per-camera monthly archives, verifies every file before deleting anything, runs on a schedule, and browses, verifies and restores archives |
-| ⬜ | **Capacity dashboard** | Pool usage, growth over time, live vs archived split |
+| ✅ | **Capacity dashboard** | Filesystem usage, growth over time, live vs archived split, per-camera breakdown |
 | ⬜ | **Timeline and playback** | Scrubbable timeline with thumbnails; clips are HEVC, so playback transcodes on demand |
 | ⬜ | **Mobile layouts** | Desktop-first for now; the timeline needs a different treatment on a phone |
 
@@ -137,6 +139,8 @@ deploying this for the first time should not require hand-editing config.
 | `POST /api/archive/verify` | Re-read an existing archive |
 | `POST /api/archive/pin` | Hold a month back from scheduled archiving, or release it |
 | `GET/PUT /api/schedule` | The archive schedule |
+| `GET /api/storage` | Filesystem usage, live vs archived split, growth rate |
+| `GET /api/storage/history?days=N` | Sampled usage history for the trend |
 | `GET /ws/progress` | Live job progress (WebSocket) |
 | `GET /ws/logs?tail=N` | Live container logs (WebSocket) |
 
@@ -195,6 +199,10 @@ A few decisions that are easy to mistake for accidents:
 - **An archive that already exists is never overwritten**, and its sources are
   never deleted on the strength of it — we only remove originals for an archive
   this app wrote and verified in the same run.
+- **Capacity comes from the filesystem, not a storage appliance's API.**
+  `statvfs` works on any host, needs no credentials, and can't go stale against
+  a vendor's API version. It reports the filesystem as mounted rather than the
+  pool beneath it — which is the number that decides whether archiving fits.
 - **Archives are plain uncompressed tar** and stay readable with `tar -xf`.
   Clips are already compressed video, so gzip would cost CPU for nothing, and
   the archive should outlive this application.

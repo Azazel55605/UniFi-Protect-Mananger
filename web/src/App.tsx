@@ -8,6 +8,7 @@ import { SetupWizard } from "@/features/setup/SetupWizard";
 import { OverviewPage } from "@/features/overview/OverviewPage";
 import { EventsPage } from "@/features/events/EventsPage";
 import { ArchivePage } from "@/features/archive/ArchivePage";
+import { CapacityPage } from "@/features/storage/CapacityPage";
 import { LogsPage } from "@/features/logs/LogsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { Placeholder } from "@/features/placeholder";
@@ -77,16 +78,7 @@ export function App() {
             }
           />
           <Route path="/archive" element={<ArchivePage />} />
-          <Route
-            path="/storage"
-            element={
-              <Placeholder
-                title="Capacity"
-                description="Pool usage, growth over time, and how much footage is live versus archived."
-                waitingOn="storage sampling"
-              />
-            }
-          />
+          <Route path="/storage" element={<CapacityPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route
             path="/settings"

@@ -13,6 +13,7 @@ import type {
   RunStatus,
 } from "@/lib/types.gen";
 import { useProgress, useProgressPercent } from "@/lib/progress";
+import { formatBytes } from "@/lib/format";
 import { SchedulePanel } from "./SchedulePanel";
 
 export function ArchivePage() {
@@ -448,11 +449,4 @@ function keysToTargets(keys: string[], due: DueEntry[]): CameraMonth[] {
   return due
     .filter((d) => keys.includes(`${d.camera}/${d.month}`))
     .map((d) => ({ camera: d.camera, month: d.month }));
-}
-
-export function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

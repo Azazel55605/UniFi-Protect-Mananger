@@ -157,6 +157,17 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS storage_samples (
+            at            REAL PRIMARY KEY,
+            live_bytes    INTEGER NOT NULL,
+            archive_bytes INTEGER NOT NULL,
+            free_bytes    INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS index_state (
             id         INTEGER PRIMARY KEY CHECK (id = 1),
             last_sync  REAL,

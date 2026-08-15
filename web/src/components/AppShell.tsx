@@ -23,7 +23,7 @@ const groups: { label: string; items: NavItem[] }[] = [
     label: "Storage",
     items: [
       { to: "/archive", label: "Archive", ready: true },
-      { to: "/storage", label: "Capacity", ready: false },
+      { to: "/storage", label: "Capacity", ready: true },
     ],
   },
   {

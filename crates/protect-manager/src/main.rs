@@ -14,6 +14,7 @@ mod docker;
 mod events;
 mod health;
 mod setup;
+mod storage;
 mod upb;
 
 use std::sync::Arc;
@@ -183,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     // background task and not fine while someone waits for a page.
     tokio::spawn(sync_loop(state.clone()));
     tokio::spawn(schedule_loop(state.clone()));
+    tokio::spawn(sample_loop(state.clone()));
 
     let static_dir = config.static_dir.clone();
     let index = ServeFile::new(static_dir.join("index.html"));
@@ -206,6 +208,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/archive/pin", post(pin_handler))
         .route("/api/schedule", get(get_schedule_handler).put(put_schedule_handler))
         .route("/ws/progress", get(progress_ws))
+        .route("/api/storage", get(storage_handler))
+        .route("/api/storage/history", get(storage_history_handler))
         .route("/api/upb/containers", get(containers_handler))
         .route("/api/upb/inspect", get(inspect_handler))
         .route("/ws/logs", get(logs_ws))
@@ -345,6 +349,33 @@ fn watch_scheduled_run(state: AppState, schedule: Schedule, run_id: i64) {
             return;
         }
     });
+}
+
+/// Record storage usage periodically, so the trend has something to plot.
+///
+/// Half-hourly: often enough that a day of history is a usable line, rare
+/// enough that a year of samples stays trivially small.
+async fn sample_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1800));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        let Ok(settings) = db::load_settings(&state.pool).await else { continue };
+        if !settings.setup_complete {
+            continue;
+        }
+        if let Err(e) = storage::take_sample(
+            &state.pool,
+            &settings,
+            &state.config.backup_dir,
+            &state.config.archive_dir,
+        )
+        .await
+        {
+            tracing::warn!("could not record a storage sample: {e}");
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -870,6 +901,48 @@ async fn progress_ws(
             }
         }
     })
+}
+
+async fn storage_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let settings = db::load_settings(&state.pool).await.unwrap_or_default();
+    match storage::snapshot(
+        &state.pool,
+        &settings,
+        &state.config.backup_dir,
+        &state.config.archive_dir,
+    )
+    .await
+    {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    #[serde(default = "default_history_days")]
+    days: f64,
+}
+
+fn default_history_days() -> f64 {
+    30.0
+}
+
+async fn storage_history_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(q): Query<HistoryQuery>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match storage::history(&state.pool, q.days.clamp(1.0, 365.0)).await {
+        Ok(h) => Json(h).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

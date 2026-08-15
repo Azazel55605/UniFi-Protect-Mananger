@@ -21,6 +21,8 @@ import type {
   NamedCheck,
   Settings,
   SetupState,
+  StorageSample,
+  StorageSnapshot,
   UpbInspection,
 } from "./types.gen";
 
@@ -124,6 +126,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ camera, month, pinned }),
     }),
+
+  storage: () => request<StorageSnapshot>("/api/storage"),
+
+  storageHistory: (days = 30) =>
+    request<StorageSample[]>(`/api/storage/history?days=${days}`),
 
   schedule: () => request<Schedule>("/api/schedule"),
 

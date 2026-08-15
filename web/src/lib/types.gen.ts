@@ -88,6 +88,8 @@ export type CameraMonth = { camera: string,
  */
 month: string, };
 
+export type CameraUsage = { camera: string, live_bytes: number, archive_bytes: number, live_clips: number, archived_months: number, };
+
 export type Check = { ok: boolean, detail: string, };
 
 /**
@@ -138,6 +140,20 @@ start: number, end: number, duration: number, status: ClipStatus,
  * Path as this container would open it. Absent when never backed up.
  */
 clip_path: string | null, size_bytes: number, };
+
+/**
+ * Usage of one filesystem, as the kernel reports it.
+ */
+export type FilesystemUsage = { 
+/**
+ * The path we asked about, as mounted in this container.
+ */
+path: string, total_bytes: number, free_bytes: number, 
+/**
+ * Device id, so two paths on the same filesystem can be recognised as one
+ * — otherwise their free space looks like twice what exists.
+ */
+device: number, };
 
 export type Health = { ok: boolean, docker: Check, container: Check, backup_dir: Check, 
 /**
@@ -279,6 +295,25 @@ targets: Array<CameraMonth>,
  * Report what would happen, writing and deleting nothing.
  */
 dry_run: boolean, };
+
+export type StorageSample = { at: number, live_bytes: number, archive_bytes: number, free_bytes: number, };
+
+export type StorageSnapshot = { backup: FilesystemUsage | null, archive: FilesystemUsage | null, 
+/**
+ * True when both directories live on the same filesystem, which changes
+ * what "free space" means for archiving: packing then deleting frees
+ * nothing until the sources go.
+ */
+same_filesystem: boolean, live_bytes: number, archive_bytes: number, cameras: Array<CameraUsage>, 
+/**
+ * Bytes per day, measured over the sampled history. `None` until there
+ * is enough history to say anything honest.
+ */
+growth_bytes_per_day: number | null, 
+/**
+ * Days until the fuller of the two filesystems runs out at that rate.
+ */
+days_until_full: number | null, };
 
 export type UpbInspection = { container: ContainerRef, running: boolean, started_at: string | null, restart_count: number, 
 /**

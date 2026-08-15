@@ -685,7 +685,7 @@ pub async fn run_restore(ctx: JobContext, target: CameraMonth) -> anyhow::Result
     let index_path = archive.clone();
     let entries = tokio::task::spawn_blocking(move || pack::list(&index_path)).await??;
     let needed: u64 = entries.iter().map(|(_, size)| size).sum();
-    if let Some(free) = free_space(&ctx.backup_dir) {
+    if let Some(free) = crate::storage::free_space(&ctx.backup_dir) {
         if free < needed + needed / 10 {
             let msg = format!(
                 "restoring needs about {} MB but only {} MB is free",
@@ -863,36 +863,6 @@ pub async fn run_verify(ctx: JobContext, target: CameraMonth) -> anyhow::Result<
     Ok(run_id)
 }
 
-/// Free bytes on the filesystem holding `path`.
-fn free_space(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc_statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { statvfs(c.as_ptr(), &mut stat) };
-    (rc == 0).then(|| stat.f_bavail.saturating_mul(stat.f_frsize))
-}
-
-#[repr(C)]
-#[allow(non_camel_case_types)]
-struct libc_statvfs {
-    f_bsize: u64,
-    f_frsize: u64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_favail: u64,
-    f_fsid: u64,
-    f_flag: u64,
-    f_namemax: u64,
-    f_spare: [i32; 6],
-}
-
-extern "C" {
-    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs) -> i32;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,7 +889,11 @@ mod tests {
                 let d = backup.join("Front Door").join(format!("{month}-{day}"));
                 std::fs::create_dir_all(&d).unwrap();
                 for i in 0..3 {
-                    std::fs::write(d.join(format!("clip{i}.mp4")), format!("{month}{day}{i}").repeat(50)).unwrap();
+                    std::fs::write(
+                        d.join(format!("clip{i}.mp4")),
+                        format!("{month}{day}{i}").repeat(50),
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -959,14 +933,10 @@ mod tests {
     #[tokio::test]
     async fn only_months_past_the_live_window_are_due() {
         let e = env("due").await;
-        let overview = overview(
-            &e.pool,
-            &e.settings,
-            &e.root.join("backup"),
-            &e.root.join("archive"),
-        )
-        .await
-        .unwrap();
+        let overview =
+            overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
+                .await
+                .unwrap();
 
         // Two months exist on disk; only the older one is eligible.
         assert_eq!(overview.due.len(), 1, "the current month must not be archived");
@@ -989,7 +959,6 @@ mod tests {
         assert_eq!(done.status, Some(RunStatus::Succeeded));
         assert!(done.message.unwrap().contains("dry run"));
         assert!(!e.root.join("archive").exists(), "a dry run must not write an archive");
-        // Sources untouched.
         let old = plan::cutoff_month(now(), 3);
         assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
 
@@ -1017,7 +986,6 @@ mod tests {
         let current = plan::cutoff_month(now(), 0);
         assert!(e.root.join("backup/Front Door").join(format!("{current}-01")).exists());
 
-        // And the archive is recorded as verified.
         let entry = sqlx::query("SELECT verify_ok, file_count FROM archives WHERE month = ?")
             .bind(&old)
             .fetch_one(&e.pool)
@@ -1073,15 +1041,17 @@ mod tests {
         let done = wait_for_finish(&jobs, rx).await;
         assert_eq!(done.status, Some(RunStatus::Succeeded), "{:?}", done.message);
 
-        // Files are back, byte for byte.
         let restored = e.root.join("backup/Front Door").join(format!("{old}-01/clip0.mp4"));
         assert!(restored.is_file());
-        assert_eq!(std::fs::read(&restored).unwrap(), format!("{old}010").repeat(50).into_bytes());
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            format!("{old}010").repeat(50).into_bytes()
+        );
 
-        // And it is pinned, so the scheduler will not immediately undo it.
-        let overview = overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
-            .await
-            .unwrap();
+        let overview =
+            overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
+                .await
+                .unwrap();
         assert!(overview.archives.iter().any(|a| a.month == old && a.pinned));
         let due = overview.due.iter().find(|d| d.month == old).unwrap();
         assert!(due.blocked.as_deref().unwrap().contains("pinned"));
@@ -1137,7 +1107,6 @@ mod tests {
         assert_eq!(done.status, Some(RunStatus::Succeeded));
         let message = done.message.unwrap();
         assert!(message.contains("previewed the oldest month"), "{message}");
-        // Still a dry run: nothing written, nothing deleted.
         assert!(!e.root.join("archive").exists());
         let old = plan::cutoff_month(now(), 3);
         assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());

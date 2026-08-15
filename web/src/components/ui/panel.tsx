@@ -25,6 +25,18 @@ export function PanelHeader({
   );
 }
 
-export function PanelBody({ className, children }: { className?: string; children: ReactNode }) {
-  return <div className={cn("p-4", className)}>{children}</div>;
+export function PanelBody({
+  className,
+  children,
+  title,
+}: {
+  className?: string;
+  children: ReactNode;
+  title?: string;
+}) {
+  return (
+    <div className={cn("p-4", className)} title={title}>
+      {children}
+    </div>
+  );
 }

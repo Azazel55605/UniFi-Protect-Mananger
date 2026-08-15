@@ -482,6 +482,71 @@ pub struct Schedule {
     pub last_run: Option<f64>,
 }
 
+// -------------------------------------------------------------- storage
+
+/// Usage of one filesystem, as the kernel reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct FilesystemUsage {
+    /// The path we asked about, as mounted in this container.
+    pub path: String,
+    #[ts(type = "number")]
+    pub total_bytes: i64,
+    #[ts(type = "number")]
+    pub free_bytes: i64,
+    /// Device id, so two paths on the same filesystem can be recognised as one
+    /// — otherwise their free space looks like twice what exists.
+    #[ts(type = "number")]
+    pub device: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct CameraUsage {
+    pub camera: String,
+    #[ts(type = "number")]
+    pub live_bytes: i64,
+    #[ts(type = "number")]
+    pub archive_bytes: i64,
+    #[ts(type = "number")]
+    pub live_clips: i64,
+    #[ts(type = "number")]
+    pub archived_months: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct StorageSnapshot {
+    pub backup: Option<FilesystemUsage>,
+    pub archive: Option<FilesystemUsage>,
+    /// True when both directories live on the same filesystem, which changes
+    /// what "free space" means for archiving: packing then deleting frees
+    /// nothing until the sources go.
+    pub same_filesystem: bool,
+    #[ts(type = "number")]
+    pub live_bytes: i64,
+    #[ts(type = "number")]
+    pub archive_bytes: i64,
+    pub cameras: Vec<CameraUsage>,
+    /// Bytes per day, measured over the sampled history. `None` until there
+    /// is enough history to say anything honest.
+    pub growth_bytes_per_day: Option<f64>,
+    /// Days until the fuller of the two filesystems runs out at that rate.
+    pub days_until_full: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct StorageSample {
+    pub at: f64,
+    #[ts(type = "number")]
+    pub live_bytes: i64,
+    #[ts(type = "number")]
+    pub archive_bytes: i64,
+    #[ts(type = "number")]
+    pub free_bytes: i64,
+}
+
 #[cfg(test)]
 mod tests {
     /// `cargo test -p protect-api-types` regenerates the TypeScript bindings;
