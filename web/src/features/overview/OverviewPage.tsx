@@ -19,6 +19,11 @@ export function OverviewPage() {
     queryFn: api.storage,
     refetchInterval: 60_000,
   });
+  const watchdog = useQuery({
+    queryKey: ["watchdog"],
+    queryFn: api.watchdog,
+    refetchInterval: 60_000,
+  });
 
   if (health.isError) {
     return (
@@ -68,6 +73,22 @@ export function OverviewPage() {
           ))}
         </PanelBody>
       </Panel>
+
+      {watchdog.data?.stalled && (
+        <Panel className="lg:col-span-2 border-bad/50">
+          <PanelHeader label="Downloads stalled" />
+          <PanelBody className="space-y-2">
+            <p className="text-sm text-bad">{watchdog.data.summary}</p>
+            <p className="text-xs text-fg-dim">
+              The backup service is still recording events but has stopped fetching
+              clips — the failure a restart usually clears.
+              {watchdog.data.config.auto_restart
+                ? " A restart will follow automatically if this persists."
+                : " Automatic restart is off; restart the container yourself, or turn it on in Settings."}
+            </p>
+          </PanelBody>
+        </Panel>
+      )}
 
       {(h?.warnings.length ?? 0) > 0 && (
         <Panel className="lg:col-span-2 border-warn/40">

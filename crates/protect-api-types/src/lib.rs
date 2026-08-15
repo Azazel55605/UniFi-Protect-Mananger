@@ -573,6 +573,63 @@ pub struct ClipInfo {
     pub prepared: bool,
 }
 
+// ------------------------------------------------------------- watchdog
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct WatchdogConfig {
+    /// Watch for the backup service recording events but not downloading them.
+    pub enabled: bool,
+    /// How long the symptom must persist before it counts. Clips are fetched
+    /// a little after the event ends, so a brief gap is normal.
+    #[ts(type = "number")]
+    pub grace_minutes: u32,
+    /// Restart the backup container when a stall is confirmed.
+    ///
+    /// Off by default: restarting someone else's container is a deliberate
+    /// choice, and the detector should earn trust on a given setup first.
+    pub auto_restart: bool,
+    /// Minimum time between automatic restarts, so a service that is broken
+    /// for another reason is not restarted in a loop.
+    #[ts(type = "number")]
+    pub restart_cooldown_minutes: u32,
+    /// Where to POST when a stall is detected. Falls back to the archive
+    /// schedule's webhook when empty, so there is one place to configure it.
+    pub webhook_url: Option<String>,
+}
+
+/// What the watchdog currently believes, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct WatchdogState {
+    pub config: WatchdogConfig,
+    pub stalled: bool,
+    /// When the symptom was first seen, if it is present now.
+    pub stalled_since: Option<f64>,
+    /// Newest event the backup service has *recorded*.
+    pub newest_event: Option<f64>,
+    /// Newest event it has actually *downloaded*.
+    pub newest_captured: Option<f64>,
+    /// Seconds between those two — the measure the detector uses.
+    pub gap_secs: Option<f64>,
+    /// Events recorded since the last successful download.
+    #[ts(type = "number")]
+    pub uncaptured: i64,
+    /// Plain-language reading of the two numbers above.
+    pub summary: String,
+    pub last_restart: Option<f64>,
+    pub log: Vec<WatchdogEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct WatchdogEvent {
+    pub at: f64,
+    /// `detected`, `restarted`, `notified`, `recovered`, or `failed`.
+    pub action: String,
+    pub detail: String,
+}
+
 #[cfg(test)]
 mod tests {
     /// `cargo test -p protect-api-types` regenerates the TypeScript bindings;

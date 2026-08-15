@@ -16,6 +16,15 @@ use tokio::sync::{broadcast, Mutex};
 
 use super::{pack, plan};
 
+/// How recently a month must have been written to for archiving to hold off.
+///
+/// The backup service and this app share the clip directory, and age is what
+/// normally keeps them apart. This is the belt to that braces: whatever the
+/// configuration says, a month that was written to minutes ago is not
+/// finished, and packing a file mid-write would archive a truncated clip and
+/// then delete the only other copy.
+const RECENT_WRITE_SECS: f64 = 3600.0;
+
 /// Only one job at a time. Two archives writing the same tar, or a restore
 /// racing an archive over the same month, is not a situation worth handling
 /// gracefully — it is one worth preventing.
@@ -285,6 +294,11 @@ pub async fn due_months(
             if month.month >= cutoff || month.files.is_empty() {
                 continue;
             }
+            let written_recently = month
+                .newest_write
+                .map(|at| now() - at < RECENT_WRITE_SECS)
+                .unwrap_or(false);
+
             let blocked = if pinned.iter().any(|(c, m)| c == camera && *m == month.month) {
                 Some("restored and pinned — release it to allow archiving".to_string())
             } else if archives
@@ -292,6 +306,11 @@ pub async fn due_months(
                 .any(|a| a.camera == *camera && a.month == month.month)
             {
                 Some("an archive already exists for this month".to_string())
+            } else if written_recently {
+                Some(
+                    "the backup service wrote to this month within the last hour —                      archiving would risk capturing a clip mid-write"
+                        .to_string(),
+                )
             } else {
                 None
             };
@@ -889,11 +908,12 @@ mod tests {
                 let d = backup.join("Front Door").join(format!("{month}-{day}"));
                 std::fs::create_dir_all(&d).unwrap();
                 for i in 0..3 {
-                    std::fs::write(
-                        d.join(format!("clip{i}.mp4")),
-                        format!("{month}{day}{i}").repeat(50),
-                    )
-                    .unwrap();
+                    let path = d.join(format!("clip{i}.mp4"));
+                    std::fs::write(&path, format!("{month}{day}{i}").repeat(50)).unwrap();
+                    // Backdate, because a real clip in an old month was
+                    // written back then — and archiving deliberately holds off
+                    // on months touched in the last hour.
+                    backdate(&path, 40.0 * 86_400.0);
                 }
             }
         }
@@ -906,6 +926,13 @@ mod tests {
             ..Default::default()
         };
         Env { root, pool, settings }
+    }
+
+    /// Set a file's modification time to `age` seconds ago.
+    fn backdate(path: &std::path::Path, age: f64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs_f64(age);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(when).unwrap();
     }
 
     fn ctx(e: &Env, jobs: &Jobs) -> JobContext {
@@ -1147,6 +1174,42 @@ mod tests {
             .unwrap();
         assert_eq!(first.phase, "preparing");
         assert!(!first.finished);
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_month_still_being_written_to_is_held_back() {
+        // The backup service and this app share the clip directory. If the
+        // other container is still writing into a month, archiving it would
+        // capture a clip mid-write and then delete the original.
+        let e = env("fresh").await;
+        let old = plan::cutoff_month(now(), 3);
+
+        // Touch one clip, as the backup service would when backfilling.
+        let touched = e
+            .root
+            .join("backup/Front Door")
+            .join(format!("{old}-01"))
+            .join("clip0.mp4");
+        backdate(&touched, 60.0);
+
+        let overview =
+            overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
+                .await
+                .unwrap();
+        let due = overview.due.iter().find(|d| d.month == old).unwrap();
+        assert!(
+            due.blocked.as_deref().unwrap_or("").contains("mid-write"),
+            "expected a hold, got {:?}",
+            due.blocked
+        );
+
+        // And "archive everything due" must not quietly include it.
+        let jobs = Jobs::default();
+        let result =
+            run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false).await;
+        assert!(result.is_err(), "a blocked month must not be archived by an 'all' run");
 
         std::fs::remove_dir_all(&e.root).unwrap();
     }

@@ -29,6 +29,8 @@ storage on a schedule, and see whether the pipeline is actually working.
   never captured, so a gap in the footage is visible rather than silent
 - Backup lag on the dashboard: time since the newest event that produced a
   clip, which catches a backup service that is running but no longer capturing
+- A watchdog for the backup service's known failure — still recording events,
+  no longer downloading them — with an optional webhook and an opt-in restart
 - Archiving that packs each camera-month into an uncompressed `.tar`, reads it
   back and compares every file against its hash, and only then removes the
   originals — with a dry run that writes nothing
@@ -156,6 +158,8 @@ deploying this for the first time should not require hand-editing config.
 | `POST /api/archive/verify` | Re-read an existing archive |
 | `POST /api/archive/pin` | Hold a month back from scheduled archiving, or release it |
 | `GET/PUT /api/schedule` | The archive schedule |
+| `GET /api/watchdog` | Stall assessment, config and recent watchdog activity |
+| `PUT /api/watchdog/config` | Configure the watchdog |
 | `GET /api/storage` | Filesystem usage, live vs archived split, growth rate |
 | `GET /api/storage/history?days=N` | Sampled usage history for the trend |
 | `GET /api/media/{id}/info` | Codec, and whether playback needs preparing first |
@@ -213,6 +217,18 @@ A few decisions that are easy to mistake for accidents:
   schema has no index on time, so reading "only what's new" scans the same
   rows anyway — and backup rows are written *after* their event, so a
   high-water mark would permanently miss clips that arrived late.
+- **A stall is detected by comparing two clocks, not by a timeout.** The
+  backup service writes an event row when it *sees* an event and a backup row
+  when it *downloads* one. Events arriving without downloads is a stall; no
+  events at all is a quiet night. A "no clips for N hours" rule cannot tell
+  those apart and would restart the service every quiet night.
+- **Two containers share the clip directory, and age is what keeps them
+  apart.** The backup service writes there; this app deletes from there. Only
+  months the backup service has finished with are ever archived — and a month
+  written to within the last hour is held back regardless, because packing a
+  file mid-write would archive a truncated clip and then remove the original.
+  If the backup service's backfill window reaches into archivable months,
+  `/api/health` says so.
 - **Nothing is deleted until the archive holding it has been read back and
   compared byte for byte.** Header-only checks catch truncation but pass a
   structurally valid archive containing wrong bytes, which is the one failure

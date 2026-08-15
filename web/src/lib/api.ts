@@ -24,6 +24,8 @@ import type {
   SetupState,
   StorageSample,
   StorageSnapshot,
+  WatchdogConfig,
+  WatchdogState,
   UpbInspection,
 } from "./types.gen";
 
@@ -135,6 +137,14 @@ export const api = {
 
   storageHistory: (days = 30) =>
     request<StorageSample[]>(`/api/storage/history?days=${days}`),
+
+  watchdog: () => request<WatchdogState>("/api/watchdog"),
+
+  saveWatchdog: (c: WatchdogConfig) =>
+    request<WatchdogState>("/api/watchdog/config", {
+      method: "PUT",
+      body: JSON.stringify(c),
+    }),
 
   schedule: () => request<Schedule>("/api/schedule"),
 

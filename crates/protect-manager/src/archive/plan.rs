@@ -15,6 +15,14 @@ pub struct MonthContents {
     /// Every clip in those directories, relative to the camera directory.
     pub files: Vec<(PathBuf, String)>,
     pub bytes: i64,
+    /// When the most recently written clip in this month was modified.
+    ///
+    /// Two containers share this directory: the backup service writes here
+    /// and we delete from it. Age alone is meant to keep them apart, but a
+    /// misconfigured backfill window can put the other process back inside a
+    /// month we consider finished — and archiving a file mid-write would
+    /// capture a truncated clip and then delete the original.
+    pub newest_write: Option<f64>,
 }
 
 impl MonthContents {
@@ -66,6 +74,7 @@ pub fn months_for_camera(backup_dir: &Path, camera: &str) -> Vec<MonthContents> 
             day_dirs: Vec::new(),
             files: Vec::new(),
             bytes: 0,
+            newest_write: None,
         });
         slot.day_dirs.push(entry.path());
 
@@ -75,7 +84,18 @@ pub fn months_for_camera(backup_dir: &Path, camera: &str) -> Vec<MonthContents> 
                     continue;
                 }
                 let name = f.file_name().to_string_lossy().to_string();
-                slot.bytes += f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                if let Ok(meta) = f.metadata() {
+                    slot.bytes += meta.len() as i64;
+                    if let Some(modified) = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs_f64())
+                    {
+                        slot.newest_write =
+                            Some(slot.newest_write.map_or(modified, |n: f64| n.max(modified)));
+                    }
+                }
                 // Stored as `<day>/<file>` so unpacking recreates the layout
                 // the backup service produced.
                 slot.files.push((f.path(), format!("{day}/{name}")));

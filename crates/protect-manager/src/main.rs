@@ -17,6 +17,7 @@ mod media;
 mod setup;
 mod storage;
 mod upb;
+mod watchdog;
 
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ use axum::extract::Path as UrlPath;
 use axum::http::HeaderMap;
 use protect_api_types::{
     CameraMonth, Check, ClipInfo, DiscoveryResult, EventQuery, Health, Schedule, SetupState,
-    Settings, StartArchiveRequest,
+    Settings, StartArchiveRequest, WatchdogConfig,
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -190,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(sync_loop(state.clone()));
     tokio::spawn(schedule_loop(state.clone()));
     tokio::spawn(sample_loop(state.clone()));
+    tokio::spawn(watchdog_loop(state.clone()));
 
     let static_dir = config.static_dir.clone();
     let index = ServeFile::new(static_dir.join("index.html"));
@@ -215,6 +217,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws/progress", get(progress_ws))
         .route("/api/storage", get(storage_handler))
         .route("/api/storage/history", get(storage_history_handler))
+        .route("/api/watchdog", get(watchdog_handler))
+        .route("/api/watchdog/config", put(watchdog_config_handler))
         .route("/api/media/{id}/info", get(clip_info_handler))
         .route("/api/media/{id}/thumb", get(thumb_handler))
         .route("/api/media/{id}/clip", get(clip_handler))
@@ -402,6 +406,23 @@ async fn sample_loop(state: AppState) {
     }
 }
 
+/// Watch for the backup service recording events but not downloading them.
+///
+/// Every two minutes: often enough to notice within the grace period, rare
+/// enough to be free. The judgement itself is two SQL aggregates.
+async fn watchdog_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(120));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        match db::load_settings(&state.pool).await {
+            Ok(s) if s.setup_complete => watchdog::tick(&state).await,
+            _ => {}
+        }
+    }
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
@@ -428,7 +449,7 @@ async fn require_auth(state: &AppState, jar: &CookieJar) -> Result<(), Response>
 /// the app breaks every time the backup service is redeployed, which for a
 /// homelab tool is often. So a stale ID falls back to discovery by image, and
 /// the new ID is written back.
-async fn current_container(
+pub async fn current_container(
     state: &AppState,
     docker: &bollard::Docker,
 ) -> anyhow::Result<Option<protect_api_types::ContainerRef>> {
@@ -525,6 +546,26 @@ async fn health_handler(State(state): State<AppState>, jar: CookieJar) -> Respon
                                 "UPB backfills missing events within {m}; gaps older than that \
                                  are permanent"
                             ));
+
+                            // Both containers share the clip directory, and age
+                            // is what keeps them apart: we only archive months
+                            // the backup service has finished with. A backfill
+                            // window that reaches into archivable months breaks
+                            // that assumption — it can write into a month we
+                            // are about to pack and delete.
+                            if let (Some(backfill), w @ 1..) =
+                                (upb::reconcile::parse_duration_secs(m), live_window)
+                            {
+                                let archivable_after = (w as f64) * 28.0 * 86_400.0;
+                                if backfill >= archivable_after {
+                                    warnings.push(format!(
+                                        "UPB backfills up to {m}, which reaches into months old \
+                                         enough to archive ({w}-month live window). It could write \
+                                         into a month while it is being packed — raise the live \
+                                         window above the backfill range."
+                                    ));
+                                }
+                            }
                         }
                         if !insp.running {
                             warnings.push("backup container is not running".into());
@@ -1104,6 +1145,27 @@ async fn original_handler(
     match resolve_clip(&state, &id).await {
         Ok(p) => media::range::serve_file(&p, "video/mp4", &headers).await,
         Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+async fn watchdog_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    Json(watchdog::state(&state.pool).await).into_response()
+}
+
+async fn watchdog_config_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<WatchdogConfig>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match watchdog::save_config(&state.pool, &body).await {
+        Ok(_) => Json(watchdog::state(&state.pool).await).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
 

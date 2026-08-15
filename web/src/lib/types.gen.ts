@@ -352,3 +352,66 @@ health_available: boolean, mounts: Array<MountInfo>,
  * credentials in plaintext.
  */
 env: Array<[string, string]>, env_withheld: number, command: string | null, retention: string | null, missing_range: string | null, proposed: ProposedConfig, };
+
+export type WatchdogConfig = { 
+/**
+ * Watch for the backup service recording events but not downloading them.
+ */
+enabled: boolean, 
+/**
+ * How long the symptom must persist before it counts. Clips are fetched
+ * a little after the event ends, so a brief gap is normal.
+ */
+grace_minutes: number, 
+/**
+ * Restart the backup container when a stall is confirmed.
+ *
+ * Off by default: restarting someone else's container is a deliberate
+ * choice, and the detector should earn trust on a given setup first.
+ */
+auto_restart: boolean, 
+/**
+ * Minimum time between automatic restarts, so a service that is broken
+ * for another reason is not restarted in a loop.
+ */
+restart_cooldown_minutes: number, 
+/**
+ * Where to POST when a stall is detected. Falls back to the archive
+ * schedule's webhook when empty, so there is one place to configure it.
+ */
+webhook_url: string | null, };
+
+export type WatchdogEvent = { at: number, 
+/**
+ * `detected`, `restarted`, `notified`, `recovered`, or `failed`.
+ */
+action: string, detail: string, };
+
+/**
+ * What the watchdog currently believes, and why.
+ */
+export type WatchdogState = { config: WatchdogConfig, stalled: boolean, 
+/**
+ * When the symptom was first seen, if it is present now.
+ */
+stalled_since: number | null, 
+/**
+ * Newest event the backup service has *recorded*.
+ */
+newest_event: number | null, 
+/**
+ * Newest event it has actually *downloaded*.
+ */
+newest_captured: number | null, 
+/**
+ * Seconds between those two — the measure the detector uses.
+ */
+gap_secs: number | null, 
+/**
+ * Events recorded since the last successful download.
+ */
+uncaptured: number, 
+/**
+ * Plain-language reading of the two numbers above.
+ */
+summary: string, last_restart: number | null, log: Array<WatchdogEvent>, };
