@@ -6,6 +6,7 @@
 //!
 //! See the roadmap in README.md for what is built and what is planned.
 
+mod archive;
 mod auth;
 mod config;
 mod db;
@@ -26,7 +27,8 @@ use axum::{Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use futures_util::StreamExt;
 use protect_api_types::{
-    Check, DiscoveryResult, EventQuery, Health, SetupState, Settings,
+    CameraMonth, Check, DiscoveryResult, EventQuery, Health, Schedule, SetupState,
+    Settings, StartArchiveRequest,
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -42,6 +44,18 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub pool: SqlitePool,
     pub docker: Option<Arc<bollard::Docker>>,
+    pub jobs: archive::run::Jobs,
+}
+
+impl AppState {
+    fn job_context(&self) -> archive::run::JobContext {
+        archive::run::JobContext {
+            pool: self.pool.clone(),
+            jobs: self.jobs.clone(),
+            backup_dir: self.config.backup_dir.clone(),
+            archive_dir: self.config.archive_dir.clone(),
+        }
+    }
 }
 
 #[tokio::main]
@@ -138,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::connect(&config.state_dir).await?;
     db::purge_expired_sessions(&pool).await;
+    // A run recorded as in-progress cannot be one: this process just started.
+    db::reconcile_interrupted_runs(&pool).await;
 
     // A missing Docker socket is reported through /api/health rather than being
     // fatal: an app that explains what's wrong beats a crash loop.
@@ -155,12 +171,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let state = AppState { config: config.clone(), pool, docker };
+    let state = AppState {
+        config: config.clone(),
+        pool,
+        docker,
+        jobs: archive::run::Jobs::default(),
+    };
 
     // The index syncs on a timer rather than on request. Reading the backup
     // service's database can block briefly while it writes, which is fine on a
     // background task and not fine while someone waits for a page.
     tokio::spawn(sync_loop(state.clone()));
+    tokio::spawn(schedule_loop(state.clone()));
 
     let static_dir = config.static_dir.clone();
     let index = ServeFile::new(static_dir.join("index.html"));
@@ -177,6 +199,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/cameras", get(cameras_handler))
         .route("/api/index/stats", get(index_stats_handler))
         .route("/api/index/sync", post(sync_now_handler))
+        .route("/api/archive", get(archive_overview_handler))
+        .route("/api/archive/runs", get(archive_runs_handler).post(start_archive_handler))
+        .route("/api/archive/restore", post(restore_handler))
+        .route("/api/archive/verify", post(verify_handler))
+        .route("/api/archive/pin", post(pin_handler))
+        .route("/api/schedule", get(get_schedule_handler).put(put_schedule_handler))
+        .route("/ws/progress", get(progress_ws))
         .route("/api/upb/containers", get(containers_handler))
         .route("/api/upb/inspect", get(inspect_handler))
         .route("/ws/logs", get(logs_ws))
@@ -251,6 +280,71 @@ async fn sync_once(state: &AppState) -> anyhow::Result<upb::reconcile::SyncOutco
         outcome.statted
     );
     Ok(outcome)
+}
+
+/// Fire scheduled archive runs, and say so loudly when one fails.
+async fn schedule_loop(state: AppState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+
+        let schedule = archive::schedule::load(&state.pool).await;
+        let now = upb::reconcile::now_secs();
+        if !archive::schedule::is_due(&schedule, now) {
+            continue;
+        }
+
+        let settings = match db::load_settings(&state.pool).await {
+            Ok(s) if s.setup_complete => s,
+            _ => continue,
+        };
+
+        tracing::info!("scheduled archive run starting");
+        // Recorded as attempted before it runs. If it fails, the next tick
+        // must not retry immediately in a loop — the failure is visible in
+        // run history and, if configured, pushed to a webhook.
+        archive::schedule::mark_ran(&state.pool, now).await;
+
+        match archive::run::run_archive(state.job_context(), settings, Vec::new(), false, true)
+            .await
+        {
+            Ok(run_id) => watch_scheduled_run(state.clone(), schedule, run_id),
+            Err(e) => {
+                // "Nothing to archive" is the normal state most of the time,
+                // not a failure worth notifying anyone about.
+                tracing::info!("scheduled run did not start: {e}");
+            }
+        }
+    }
+}
+
+/// Watch a scheduled run to completion so a failure can be pushed outward.
+fn watch_scheduled_run(state: AppState, schedule: Schedule, run_id: i64) {
+    let Some(url) = schedule.webhook_url.clone() else { return };
+    let mut rx = state.jobs.progress.subscribe();
+
+    tokio::spawn(async move {
+        while let Ok(p) = rx.recv().await {
+            if p.run_id != run_id || !p.finished {
+                continue;
+            }
+            if matches!(
+                p.status,
+                Some(protect_api_types::RunStatus::Failed)
+                    | Some(protect_api_types::RunStatus::Interrupted)
+            ) {
+                archive::schedule::notify_failure(
+                    &url,
+                    run_id,
+                    p.message.as_deref().unwrap_or("archive run failed"),
+                )
+                .await;
+            }
+            return;
+        }
+    });
 }
 
 async fn shutdown_signal() {
@@ -623,6 +717,159 @@ async fn sync_now_handler(State(state): State<AppState>, jar: CookieJar) -> Resp
             (StatusCode::CONFLICT, format!("{e}")).into_response()
         }
     }
+}
+
+async fn archive_overview_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let settings = db::load_settings(&state.pool).await.unwrap_or_default();
+    match archive::run::overview(
+        &state.pool,
+        &settings,
+        &state.config.backup_dir,
+        &state.config.archive_dir,
+    )
+    .await
+    {
+        Ok(o) => Json(o).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn archive_runs_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match archive::run::recent_runs(&state.pool, 50).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn start_archive_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<StartArchiveRequest>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let settings = match db::load_settings(&state.pool).await {
+        Ok(s) if s.setup_complete => s,
+        _ => return (StatusCode::CONFLICT, "setup is not complete").into_response(),
+    };
+
+    match archive::run::run_archive(
+        state.job_context(),
+        settings,
+        body.targets,
+        body.dry_run,
+        false,
+    )
+    .await
+    {
+        Ok(id) => Json(serde_json::json!({ "run_id": id })).into_response(),
+        Err(e) => (StatusCode::CONFLICT, format!("{e}")).into_response(),
+    }
+}
+
+async fn restore_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(target): Json<CameraMonth>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match archive::run::run_restore(state.job_context(), target).await {
+        Ok(id) => Json(serde_json::json!({ "run_id": id })).into_response(),
+        Err(e) => (StatusCode::CONFLICT, format!("{e}")).into_response(),
+    }
+}
+
+async fn verify_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(target): Json<CameraMonth>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match archive::run::run_verify(state.job_context(), target).await {
+        Ok(id) => Json(serde_json::json!({ "run_id": id })).into_response(),
+        Err(e) => (StatusCode::CONFLICT, format!("{e}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PinRequest {
+    camera: String,
+    month: String,
+    pinned: bool,
+}
+
+/// Release (or re-apply) a pin, so a restored month can be archived again.
+async fn pin_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<PinRequest>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let result = sqlx::query("UPDATE archives SET pinned = ? WHERE camera = ? AND month = ?")
+        .bind(body.pinned as i32)
+        .bind(&body.camera)
+        .bind(&body.month)
+        .execute(&state.pool)
+        .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+async fn get_schedule_handler(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    Json(archive::schedule::load(&state.pool).await).into_response()
+}
+
+async fn put_schedule_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(body): Json<Schedule>,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    match archive::schedule::save(&state.pool, &body).await {
+        Ok(_) => Json(archive::schedule::load(&state.pool).await).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
+}
+
+/// Live job progress. Same cookie auth as the log stream.
+async fn progress_ws(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(r) = require_auth(&state, &jar).await {
+        return r;
+    }
+    let mut rx = state.jobs.progress.subscribe();
+    ws.on_upgrade(move |mut socket| async move {
+        while let Ok(update) = rx.recv().await {
+            let Ok(text) = serde_json::to_string(&update) else { continue };
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 #[derive(Deserialize)]

@@ -1,0 +1,1071 @@
+//! Running archive, restore and verify jobs, and recording what happened.
+//!
+//! The order of operations is the whole point: pack, verify, *then* delete.
+//! Nothing removes a source file until the archive holding it has been read
+//! back and compared byte for byte.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use protect_api_types::{
+    ArchiveEntry, ArchiveOverview, ArchiveRun, CameraMonth, DueEntry, RunKind, RunProgress,
+    RunStatus, Settings,
+};
+use sqlx::{Row, SqlitePool};
+use tokio::sync::{broadcast, Mutex};
+
+use super::{pack, plan};
+
+/// Only one job at a time. Two archives writing the same tar, or a restore
+/// racing an archive over the same month, is not a situation worth handling
+/// gracefully — it is one worth preventing.
+pub type JobLock = Arc<Mutex<()>>;
+
+#[derive(Clone)]
+pub struct Jobs {
+    pub lock: JobLock,
+    pub progress: broadcast::Sender<RunProgress>,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Self { lock: Arc::new(Mutex::new(())), progress: broadcast::channel(256).0 }
+    }
+}
+
+fn now() -> f64 {
+    crate::upb::reconcile::now_secs()
+}
+
+fn kind_str(k: RunKind) -> &'static str {
+    match k {
+        RunKind::Archive => "archive",
+        RunKind::Restore => "restore",
+        RunKind::Verify => "verify",
+    }
+}
+
+fn kind_from(s: &str) -> RunKind {
+    match s {
+        "restore" => RunKind::Restore,
+        "verify" => RunKind::Verify,
+        _ => RunKind::Archive,
+    }
+}
+
+fn status_str(s: RunStatus) -> &'static str {
+    match s {
+        RunStatus::Running => "running",
+        RunStatus::Succeeded => "succeeded",
+        RunStatus::Failed => "failed",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
+fn status_from(s: &str) -> RunStatus {
+    match s {
+        "running" => RunStatus::Running,
+        "succeeded" => RunStatus::Succeeded,
+        "interrupted" => RunStatus::Interrupted,
+        _ => RunStatus::Failed,
+    }
+}
+
+// ------------------------------------------------------------ run records
+
+async fn start_run(
+    pool: &SqlitePool,
+    kind: RunKind,
+    target: Option<&CameraMonth>,
+    dry_run: bool,
+    scheduled: bool,
+    files_total: i64,
+) -> anyhow::Result<i64> {
+    let id = sqlx::query(
+        "INSERT INTO archive_runs (kind, status, camera, month, started, dry_run, scheduled, files_total)
+         VALUES (?, 'running', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(kind_str(kind))
+    .bind(target.map(|t| t.camera.clone()))
+    .bind(target.map(|t| t.month.clone()))
+    .bind(now())
+    .bind(dry_run as i32)
+    .bind(scheduled as i32)
+    .bind(files_total)
+    .execute(pool)
+    .await?
+    .last_insert_rowid();
+    Ok(id)
+}
+
+async fn finish_run(
+    pool: &SqlitePool,
+    id: i64,
+    status: RunStatus,
+    message: Option<String>,
+    files_done: i64,
+    bytes: i64,
+    failed: &[String],
+) {
+    let _ = sqlx::query(
+        "UPDATE archive_runs
+            SET status = ?, finished = ?, message = ?, files_done = ?, bytes_total = ?,
+                failed_files = ?
+          WHERE id = ?",
+    )
+    .bind(status_str(status))
+    .bind(now())
+    .bind(message)
+    .bind(files_done)
+    .bind(bytes)
+    .bind(failed.join("\n"))
+    .bind(id)
+    .execute(pool)
+    .await;
+}
+
+pub async fn recent_runs(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<ArchiveRun>> {
+    let rows = sqlx::query("SELECT * FROM archive_runs ORDER BY started DESC LIMIT ?")
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(row_to_run).collect())
+}
+
+fn row_to_run(r: &sqlx::sqlite::SqliteRow) -> ArchiveRun {
+    let failed: String = r.get("failed_files");
+    ArchiveRun {
+        id: r.get("id"),
+        kind: kind_from(&r.get::<String, _>("kind")),
+        status: status_from(&r.get::<String, _>("status")),
+        camera: r.get("camera"),
+        month: r.get("month"),
+        started: r.get("started"),
+        finished: r.get("finished"),
+        dry_run: r.get::<i64, _>("dry_run") != 0,
+        scheduled: r.get::<i64, _>("scheduled") != 0,
+        files_total: r.get("files_total"),
+        files_done: r.get("files_done"),
+        bytes_total: r.get("bytes_total"),
+        message: r.get("message"),
+        failed_files: failed.lines().map(str::to_string).filter(|s| !s.is_empty()).collect(),
+    }
+}
+
+// ------------------------------------------------------------- inventory
+
+/// What exists, what is due, and what has gone missing.
+pub async fn overview(
+    pool: &SqlitePool,
+    settings: &Settings,
+    backup_dir: &Path,
+    archive_dir: &Path,
+) -> anyhow::Result<ArchiveOverview> {
+    let recorded = sqlx::query("SELECT * FROM archives ORDER BY camera, month")
+        .fetch_all(pool)
+        .await?;
+
+    let mut archives: Vec<ArchiveEntry> = Vec::new();
+    let mut missing_archives = Vec::new();
+
+    for r in &recorded {
+        let camera: String = r.get("camera");
+        let month: String = r.get("month");
+        let path: String = r.get("path");
+        if !Path::new(&path).is_file() {
+            // Recorded as archived, but the tar is gone. Silently dropping
+            // this would hide the loss of a whole month of footage.
+            missing_archives.push(CameraMonth { camera, month });
+            continue;
+        }
+        archives.push(ArchiveEntry {
+            camera,
+            month,
+            path,
+            size_bytes: r.get("size_bytes"),
+            file_count: r.get("file_count"),
+            created: r.get("created"),
+            verified_at: r.get("verified_at"),
+            verify_ok: r.get::<Option<i64>, _>("verify_ok").map(|v| v != 0),
+            pinned: r.get::<i64, _>("pinned") != 0,
+            unrecorded: false,
+        });
+    }
+
+    // Tars on disk we have no record of: made by hand, or by whatever handled
+    // archiving before this app did. They are real archives and belong in the
+    // list, flagged so the difference is visible.
+    if let Ok(cameras) = std::fs::read_dir(archive_dir) {
+        for cam in cameras.filter_map(Result::ok) {
+            if !cam.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let camera = cam.file_name().to_string_lossy().to_string();
+            let Ok(files) = std::fs::read_dir(cam.path()) else { continue };
+            for f in files.filter_map(Result::ok) {
+                let name = f.file_name().to_string_lossy().to_string();
+                let Some(month) = name.strip_suffix(".tar") else { continue };
+                if archives.iter().any(|a| a.camera == camera && a.month == month) {
+                    continue;
+                }
+                let meta = f.metadata().ok();
+                archives.push(ArchiveEntry {
+                    camera: camera.clone(),
+                    month: month.to_string(),
+                    path: f.path().to_string_lossy().to_string(),
+                    size_bytes: meta.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                    // Counting entries means a header walk per archive; left
+                    // for the on-demand verify rather than done on every list.
+                    file_count: 0,
+                    created: None,
+                    verified_at: None,
+                    verify_ok: None,
+                    pinned: false,
+                    unrecorded: true,
+                });
+            }
+        }
+    }
+    archives.sort_by(|a, b| a.camera.cmp(&b.camera).then(b.month.cmp(&a.month)));
+
+    let due = due_months(pool, settings, backup_dir, &archives).await?;
+    let total_bytes = archives.iter().map(|a| a.size_bytes).sum();
+
+    let running = sqlx::query("SELECT * FROM archive_runs WHERE status = 'running' LIMIT 1")
+        .fetch_optional(pool)
+        .await?
+        .map(|r| row_to_run(&r));
+
+    Ok(ArchiveOverview { archives, due, missing_archives, total_bytes, running })
+}
+
+/// Camera-months old enough to archive that haven't been.
+pub async fn due_months(
+    pool: &SqlitePool,
+    settings: &Settings,
+    backup_dir: &Path,
+    archives: &[ArchiveEntry],
+) -> anyhow::Result<Vec<DueEntry>> {
+    let cutoff = plan::cutoff_month(now(), settings.live_window_months);
+    let pinned: Vec<(String, String)> =
+        sqlx::query("SELECT camera, month FROM archives WHERE pinned = 1")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| (r.get("camera"), r.get("month")))
+            .collect();
+
+    let mut due = Vec::new();
+    for camera in &settings.camera_dirs {
+        for month in plan::months_for_camera(backup_dir, camera) {
+            // Whole months only, and only ones entirely past the live window.
+            if month.month >= cutoff || month.files.is_empty() {
+                continue;
+            }
+            let blocked = if pinned.iter().any(|(c, m)| c == camera && *m == month.month) {
+                Some("restored and pinned — release it to allow archiving".to_string())
+            } else if archives
+                .iter()
+                .any(|a| a.camera == *camera && a.month == month.month)
+            {
+                Some("an archive already exists for this month".to_string())
+            } else {
+                None
+            };
+
+            due.push(DueEntry {
+                camera: camera.clone(),
+                month: month.month.clone(),
+                file_count: month.files.len() as i64,
+                bytes: month.bytes,
+                blocked,
+            });
+        }
+    }
+    due.sort_by(|a, b| a.month.cmp(&b.month).then(a.camera.cmp(&b.camera)));
+    Ok(due)
+}
+
+// ------------------------------------------------------------------ jobs
+
+pub struct JobContext {
+    pub pool: SqlitePool,
+    pub jobs: Jobs,
+    pub backup_dir: PathBuf,
+    pub archive_dir: PathBuf,
+}
+
+/// Archive the given camera-months, or everything due when none are given.
+pub async fn run_archive(
+    ctx: JobContext,
+    settings: Settings,
+    targets: Vec<CameraMonth>,
+    dry_run: bool,
+    scheduled: bool,
+) -> anyhow::Result<i64> {
+    let guard = ctx.jobs.lock.clone().try_lock_owned();
+    let Ok(guard) = guard else {
+        anyhow::bail!("another job is already running");
+    };
+
+    let overview = overview(&ctx.pool, &settings, &ctx.backup_dir, &ctx.archive_dir).await?;
+    let selected: Vec<CameraMonth> = if targets.is_empty() {
+        overview
+            .due
+            .iter()
+            .filter(|d| d.blocked.is_none())
+            .map(|d| CameraMonth { camera: d.camera.clone(), month: d.month.clone() })
+            .collect()
+    } else {
+        targets
+    };
+
+    if selected.is_empty() {
+        anyhow::bail!("nothing to archive");
+    }
+
+    let months: Vec<plan::MonthContents> = selected
+        .iter()
+        .filter_map(|t| {
+            plan::months_for_camera(&ctx.backup_dir, &t.camera)
+                .into_iter()
+                .find(|m| m.month == t.month)
+        })
+        .collect();
+
+    let overall_total: i64 = months.iter().map(|m| m.files.len() as i64).sum();
+    let single = (months.len() == 1).then(|| months[0].key());
+    let run_id = start_run(
+        &ctx.pool,
+        RunKind::Archive,
+        single.as_ref(),
+        dry_run,
+        scheduled,
+        overall_total,
+    )
+    .await?;
+
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result =
+            archive_months(&ctx, &settings, run_id, months, overall_total, dry_run).await;
+
+        let (status, message, done, bytes, failed) = match result {
+            Ok(o) => (
+                if o.failed.is_empty() { RunStatus::Succeeded } else { RunStatus::Failed },
+                Some(o.message),
+                o.done,
+                o.bytes,
+                o.failed,
+            ),
+            Err(e) => (RunStatus::Failed, Some(e.to_string()), 0, 0, Vec::new()),
+        };
+
+        finish_run(&ctx.pool, run_id, status, message.clone(), done, bytes, &failed).await;
+        let _ = ctx.jobs.progress.send(RunProgress {
+            run_id,
+            kind: RunKind::Archive,
+            camera: None,
+            month: None,
+            phase: "done".into(),
+            current_file: None,
+            files_done: done,
+            files_total: overall_total,
+            overall_done: done,
+            overall_total,
+            finished: true,
+            status: Some(status),
+            message,
+        });
+    });
+
+    Ok(run_id)
+}
+
+struct ArchiveOutcome {
+    done: i64,
+    bytes: i64,
+    failed: Vec<String>,
+    message: String,
+}
+
+async fn archive_months(
+    ctx: &JobContext,
+    settings: &Settings,
+    run_id: i64,
+    months: Vec<plan::MonthContents>,
+    overall_total: i64,
+    dry_run: bool,
+) -> anyhow::Result<ArchiveOutcome> {
+    let mut overall_done = 0i64;
+    let mut bytes = 0i64;
+    let mut failed = Vec::new();
+    let mut archived = 0usize;
+    let mut skipped = Vec::new();
+
+    for month in months {
+        let dest = plan::archive_path(&ctx.archive_dir, &month.camera, &month.month);
+        if dest.exists() {
+            skipped.push(format!("{}/{}", month.camera, month.month));
+            overall_done += month.files.len() as i64;
+            continue;
+        }
+
+        if dry_run {
+            overall_done += month.files.len() as i64;
+            bytes += month.bytes;
+            archived += 1;
+            emit(
+                ctx,
+                run_id,
+                &month,
+                "would archive",
+                None,
+                Counts {
+                    done: month.files.len() as i64,
+                    total: month.files.len() as i64,
+                    overall_done,
+                    overall_total,
+                },
+            );
+            continue;
+        }
+
+        // Packing and verifying are long, blocking, I/O-heavy jobs; they must
+        // not sit on the async runtime's worker threads.
+        let progress = ctx.jobs.progress.clone();
+        let month_for_task = month.clone();
+        let dest_for_task = dest.clone();
+        let base = overall_done;
+
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let packed = pack::pack(&month_for_task, &dest_for_task, |p| {
+                let _ = progress.send(RunProgress {
+                    run_id,
+                    kind: RunKind::Archive,
+                    camera: Some(month_for_task.camera.clone()),
+                    month: Some(month_for_task.month.clone()),
+                    phase: "packing".into(),
+                    current_file: Some(p.name.to_string()),
+                    files_done: p.index as i64 + 1,
+                    files_total: p.total as i64,
+                    overall_done: base + p.index as i64 + 1,
+                    overall_total,
+                    finished: false,
+                    status: None,
+                    message: None,
+                });
+            })?;
+
+            let verified = pack::verify(&dest_for_task, &packed.hashes, |p| {
+                let _ = progress.send(RunProgress {
+                    run_id,
+                    kind: RunKind::Archive,
+                    camera: Some(month_for_task.camera.clone()),
+                    month: Some(month_for_task.month.clone()),
+                    phase: "verifying".into(),
+                    current_file: Some(p.name.to_string()),
+                    files_done: p.index as i64 + 1,
+                    files_total: p.total as i64,
+                    overall_done: base + p.total as i64,
+                    overall_total,
+                    finished: false,
+                    status: None,
+                    message: None,
+                });
+            })?;
+
+            Ok((packed.bytes_written, packed.hashes.len(), verified))
+        })
+        .await??;
+
+        let (written, count, verified) = outcome;
+        overall_done += month.files.len() as i64;
+        bytes += written as i64;
+
+        if !verified.ok() {
+            // The archive is not a faithful copy, so the originals stay put
+            // and the bad tar is removed rather than left to look finished.
+            let _ = std::fs::remove_file(&dest);
+            failed.extend(verified.failed_files());
+            tracing::error!(
+                "verification failed for {}/{}: {} — sources left in place",
+                month.camera,
+                month.month,
+                verified.summary()
+            );
+            continue;
+        }
+
+        record_archive(&ctx.pool, &month, &dest, written as i64, count as i64).await;
+
+        if settings.keep_sources_after_archive {
+            tracing::info!("{}/{} archived; sources kept by configuration", month.camera, month.month);
+        } else {
+            emit(
+                ctx,
+                run_id,
+                &month,
+                "removing originals",
+                None,
+                Counts {
+                    done: count as i64,
+                    total: count as i64,
+                    overall_done,
+                    overall_total,
+                },
+            );
+            for dir in &month.day_dirs {
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    tracing::error!("archived {}/{} but could not remove {}: {e}",
+                        month.camera, month.month, dir.display());
+                }
+            }
+        }
+        archived += 1;
+    }
+
+    let mut message = if dry_run {
+        format!("dry run: would archive {archived} camera-month(s)")
+    } else {
+        format!("archived {archived} camera-month(s)")
+    };
+    if !skipped.is_empty() {
+        message.push_str(&format!("; skipped {} that already exist", skipped.len()));
+    }
+    if !failed.is_empty() {
+        message.push_str(&format!("; {} file(s) failed verification", failed.len()));
+    }
+
+    Ok(ArchiveOutcome { done: overall_done, bytes, failed, message })
+}
+
+/// Counters for one progress update, grouped because nine positional
+/// arguments is a call site nobody can read.
+struct Counts {
+    done: i64,
+    total: i64,
+    overall_done: i64,
+    overall_total: i64,
+}
+
+fn emit(
+    ctx: &JobContext,
+    run_id: i64,
+    month: &plan::MonthContents,
+    phase: &str,
+    file: Option<String>,
+    counts: Counts,
+) {
+    let Counts { done, total, overall_done, overall_total } = counts;
+    let _ = ctx.jobs.progress.send(RunProgress {
+        run_id,
+        kind: RunKind::Archive,
+        camera: Some(month.camera.clone()),
+        month: Some(month.month.clone()),
+        phase: phase.into(),
+        current_file: file,
+        files_done: done,
+        files_total: total,
+        overall_done,
+        overall_total,
+        finished: false,
+        status: None,
+        message: None,
+    });
+}
+
+async fn record_archive(
+    pool: &SqlitePool,
+    month: &plan::MonthContents,
+    dest: &Path,
+    size: i64,
+    files: i64,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO archives (camera, month, path, size_bytes, file_count, created,
+                               verified_at, verify_ok, pinned)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
+         ON CONFLICT(camera, month) DO UPDATE SET
+            path = excluded.path, size_bytes = excluded.size_bytes,
+            file_count = excluded.file_count, verified_at = excluded.verified_at,
+            verify_ok = 1, pinned = 0",
+    )
+    .bind(&month.camera)
+    .bind(&month.month)
+    .bind(dest.to_string_lossy().to_string())
+    .bind(size)
+    .bind(files)
+    .bind(now())
+    .bind(now())
+    .execute(pool)
+    .await;
+}
+
+/// Restore an archived camera-month back into the live directory.
+pub async fn run_restore(ctx: JobContext, target: CameraMonth) -> anyhow::Result<i64> {
+    let guard = ctx.jobs.lock.clone().try_lock_owned();
+    let Ok(guard) = guard else {
+        anyhow::bail!("another job is already running");
+    };
+
+    let archive = plan::archive_path(&ctx.archive_dir, &target.camera, &target.month);
+    if !archive.is_file() {
+        anyhow::bail!("no archive at {}", archive.display());
+    }
+
+    // Restoring writes back everything the archive holds, so refusing early
+    // beats filling the disk halfway through.
+    let entries = pack::list(&archive)?;
+    let needed: u64 = entries.iter().map(|(_, size)| size).sum();
+    if let Some(free) = free_space(&ctx.backup_dir) {
+        if free < needed + needed / 10 {
+            anyhow::bail!(
+                "restoring needs about {} MB but only {} MB is free",
+                needed / 1_048_576,
+                free / 1_048_576
+            );
+        }
+    }
+
+    let run_id = start_run(
+        &ctx.pool,
+        RunKind::Restore,
+        Some(&target),
+        false,
+        false,
+        entries.len() as i64,
+    )
+    .await?;
+
+    tokio::spawn(async move {
+        let _guard = guard;
+        let dest = ctx.backup_dir.join(&target.camera);
+        let progress = ctx.jobs.progress.clone();
+        let total = entries.len() as i64;
+        let t = target.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            pack::unpack(&archive, &dest, |p| {
+                let _ = progress.send(RunProgress {
+                    run_id,
+                    kind: RunKind::Restore,
+                    camera: Some(t.camera.clone()),
+                    month: Some(t.month.clone()),
+                    phase: "restoring".into(),
+                    current_file: Some(p.name.to_string()),
+                    files_done: p.index as i64 + 1,
+                    files_total: p.total as i64,
+                    overall_done: p.index as i64 + 1,
+                    overall_total: p.total as i64,
+                    finished: false,
+                    status: None,
+                    message: None,
+                });
+            })
+        })
+        .await;
+
+        let (status, message, done) = match result {
+            Ok(Ok(count)) => {
+                // Pin it, or the next scheduled run archives it straight back
+                // — the month is older than the live window by definition.
+                let _ = sqlx::query(
+                    "UPDATE archives SET pinned = 1 WHERE camera = ? AND month = ?",
+                )
+                .bind(&target.camera)
+                .bind(&target.month)
+                .execute(&ctx.pool)
+                .await;
+                (
+                    RunStatus::Succeeded,
+                    format!("restored {count} files; month pinned so it will not be re-archived"),
+                    count as i64,
+                )
+            }
+            Ok(Err(e)) => (RunStatus::Failed, e.to_string(), 0),
+            Err(e) => (RunStatus::Failed, e.to_string(), 0),
+        };
+
+        finish_run(&ctx.pool, run_id, status, Some(message.clone()), done, 0, &[]).await;
+        let _ = ctx.jobs.progress.send(RunProgress {
+            run_id,
+            kind: RunKind::Restore,
+            camera: Some(target.camera),
+            month: Some(target.month),
+            phase: "done".into(),
+            current_file: None,
+            files_done: done,
+            files_total: total,
+            overall_done: done,
+            overall_total: total,
+            finished: true,
+            status: Some(status),
+            message: Some(message),
+        });
+    });
+
+    Ok(run_id)
+}
+
+/// Re-verify an archive that already exists, without touching anything else.
+pub async fn run_verify(ctx: JobContext, target: CameraMonth) -> anyhow::Result<i64> {
+    let guard = ctx.jobs.lock.clone().try_lock_owned();
+    let Ok(guard) = guard else {
+        anyhow::bail!("another job is already running");
+    };
+
+    let archive = plan::archive_path(&ctx.archive_dir, &target.camera, &target.month);
+    if !archive.is_file() {
+        anyhow::bail!("no archive at {}", archive.display());
+    }
+
+    let run_id = start_run(&ctx.pool, RunKind::Verify, Some(&target), false, false, 0).await?;
+
+    tokio::spawn(async move {
+        let _guard = guard;
+        let progress = ctx.jobs.progress.clone();
+        let t = target.clone();
+
+        // Without stored hashes this can only confirm the archive reads back
+        // cleanly end to end — structure, not content. Said plainly rather
+        // than reported as a full verification.
+        let result = tokio::task::spawn_blocking(move || {
+            let entries = pack::list(&archive)?;
+            let total = entries.len();
+            let expected = std::collections::BTreeMap::new();
+            let r = pack::verify(&archive, &expected, |p| {
+                let _ = progress.send(RunProgress {
+                    run_id,
+                    kind: RunKind::Verify,
+                    camera: Some(t.camera.clone()),
+                    month: Some(t.month.clone()),
+                    phase: "reading".into(),
+                    current_file: Some(p.name.to_string()),
+                    files_done: p.index as i64 + 1,
+                    files_total: total as i64,
+                    overall_done: p.index as i64 + 1,
+                    overall_total: total as i64,
+                    finished: false,
+                    status: None,
+                    message: None,
+                });
+            })?;
+            Ok::<_, anyhow::Error>((total, r.checked))
+        })
+        .await;
+
+        let (status, message, done) = match result {
+            Ok(Ok((total, read))) => (
+                RunStatus::Succeeded,
+                format!("{read} of {total} entries read back without error"),
+                read as i64,
+            ),
+            Ok(Err(e)) => (RunStatus::Failed, format!("archive is unreadable: {e}"), 0),
+            Err(e) => (RunStatus::Failed, e.to_string(), 0),
+        };
+
+        let ok = matches!(status, RunStatus::Succeeded);
+        let _ = sqlx::query(
+            "UPDATE archives SET verified_at = ?, verify_ok = ? WHERE camera = ? AND month = ?",
+        )
+        .bind(now())
+        .bind(ok as i32)
+        .bind(&target.camera)
+        .bind(&target.month)
+        .execute(&ctx.pool)
+        .await;
+
+        finish_run(&ctx.pool, run_id, status, Some(message.clone()), done, 0, &[]).await;
+        let _ = ctx.jobs.progress.send(RunProgress {
+            run_id,
+            kind: RunKind::Verify,
+            camera: Some(target.camera),
+            month: Some(target.month),
+            phase: "done".into(),
+            current_file: None,
+            files_done: done,
+            files_total: done,
+            overall_done: done,
+            overall_total: done,
+            finished: true,
+            status: Some(status),
+            message: Some(message),
+        });
+    });
+
+    Ok(run_id)
+}
+
+/// Free bytes on the filesystem holding `path`.
+fn free_space(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc_statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { statvfs(c.as_ptr(), &mut stat) };
+    (rc == 0).then(|| stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct libc_statvfs {
+    f_bsize: u64,
+    f_frsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: u64,
+    f_flag: u64,
+    f_namemax: u64,
+    f_spare: [i32; 6],
+}
+
+extern "C" {
+    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Env {
+        root: PathBuf,
+        pool: SqlitePool,
+        settings: Settings,
+    }
+
+    /// Two months of clips: one old enough to archive, one still live.
+    async fn env(name: &str) -> Env {
+        let root = std::env::temp_dir().join(format!("pm-run-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = root.join("backup");
+
+        // `now` is inside the current month, so an old month is safely past a
+        // 1-month live window whatever today's date happens to be.
+        let old = plan::cutoff_month(now(), 3);
+        let current = plan::cutoff_month(now(), 0);
+
+        for (month, days) in [(&old, ["01", "02"]), (&current, ["01", "02"])] {
+            for day in days {
+                let d = backup.join("Front Door").join(format!("{month}-{day}"));
+                std::fs::create_dir_all(&d).unwrap();
+                for i in 0..3 {
+                    std::fs::write(d.join(format!("clip{i}.mp4")), format!("{month}{day}{i}").repeat(50)).unwrap();
+                }
+            }
+        }
+
+        let pool = crate::db::connect(&root.join("state")).await.unwrap();
+        let settings = Settings {
+            camera_dirs: vec!["Front Door".into()],
+            live_window_months: 1,
+            setup_complete: true,
+            ..Default::default()
+        };
+        Env { root, pool, settings }
+    }
+
+    fn ctx(e: &Env, jobs: &Jobs) -> JobContext {
+        JobContext {
+            pool: e.pool.clone(),
+            jobs: jobs.clone(),
+            backup_dir: e.root.join("backup"),
+            archive_dir: e.root.join("archive"),
+        }
+    }
+
+    async fn wait_for_finish(jobs: &Jobs, mut rx: broadcast::Receiver<RunProgress>) -> RunProgress {
+        let _ = jobs;
+        loop {
+            let p = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("job did not finish in time")
+                .expect("progress channel closed");
+            if p.finished {
+                return p;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_months_past_the_live_window_are_due() {
+        let e = env("due").await;
+        let overview = overview(
+            &e.pool,
+            &e.settings,
+            &e.root.join("backup"),
+            &e.root.join("archive"),
+        )
+        .await
+        .unwrap();
+
+        // Two months exist on disk; only the older one is eligible.
+        assert_eq!(overview.due.len(), 1, "the current month must not be archived");
+        assert_eq!(overview.due[0].file_count, 6);
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_writes_and_deletes_nothing() {
+        let e = env("dryrun").await;
+        let jobs = Jobs::default();
+        let rx = jobs.progress.subscribe();
+
+        run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), true, false)
+            .await
+            .unwrap();
+        let done = wait_for_finish(&jobs, rx).await;
+
+        assert_eq!(done.status, Some(RunStatus::Succeeded));
+        assert!(done.message.unwrap().contains("dry run"));
+        assert!(!e.root.join("archive").exists(), "a dry run must not write an archive");
+        // Sources untouched.
+        let old = plan::cutoff_month(now(), 3);
+        assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn archiving_verifies_then_removes_the_originals() {
+        let e = env("archive").await;
+        let jobs = Jobs::default();
+        let rx = jobs.progress.subscribe();
+        let old = plan::cutoff_month(now(), 3);
+
+        run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false)
+            .await
+            .unwrap();
+        let done = wait_for_finish(&jobs, rx).await;
+        assert_eq!(done.status, Some(RunStatus::Succeeded), "{:?}", done.message);
+
+        let tar = e.root.join("archive/Front Door").join(format!("{old}.tar"));
+        assert!(tar.is_file(), "archive written");
+
+        // The source days for the archived month are gone; the live month is not.
+        assert!(!e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
+        let current = plan::cutoff_month(now(), 0);
+        assert!(e.root.join("backup/Front Door").join(format!("{current}-01")).exists());
+
+        // And the archive is recorded as verified.
+        let entry = sqlx::query("SELECT verify_ok, file_count FROM archives WHERE month = ?")
+            .bind(&old)
+            .fetch_one(&e.pool)
+            .await
+            .unwrap();
+        assert_eq!(entry.get::<i64, _>("verify_ok"), 1);
+        assert_eq!(entry.get::<i64, _>("file_count"), 6);
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn keeping_sources_leaves_the_originals_in_place() {
+        let e = env("keep").await;
+        let mut settings = e.settings.clone();
+        settings.keep_sources_after_archive = true;
+        let jobs = Jobs::default();
+        let rx = jobs.progress.subscribe();
+        let old = plan::cutoff_month(now(), 3);
+
+        run_archive(ctx(&e, &jobs), settings, Vec::new(), false, false).await.unwrap();
+        wait_for_finish(&jobs, rx).await;
+
+        assert!(e.root.join("archive/Front Door").join(format!("{old}.tar")).is_file());
+        assert!(
+            e.root.join("backup/Front Door").join(format!("{old}-01")).exists(),
+            "sources must survive when the setting says to keep them"
+        );
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restoring_brings_a_month_back_and_pins_it() {
+        let e = env("restore").await;
+        let jobs = Jobs::default();
+        let old = plan::cutoff_month(now(), 3);
+
+        let rx = jobs.progress.subscribe();
+        run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false)
+            .await
+            .unwrap();
+        wait_for_finish(&jobs, rx).await;
+        assert!(!e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
+
+        let rx = jobs.progress.subscribe();
+        run_restore(
+            ctx(&e, &jobs),
+            CameraMonth { camera: "Front Door".into(), month: old.clone() },
+        )
+        .await
+        .unwrap();
+        let done = wait_for_finish(&jobs, rx).await;
+        assert_eq!(done.status, Some(RunStatus::Succeeded), "{:?}", done.message);
+
+        // Files are back, byte for byte.
+        let restored = e.root.join("backup/Front Door").join(format!("{old}-01/clip0.mp4"));
+        assert!(restored.is_file());
+        assert_eq!(std::fs::read(&restored).unwrap(), format!("{old}010").repeat(50).into_bytes());
+
+        // And it is pinned, so the scheduler will not immediately undo it.
+        let overview = overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
+            .await
+            .unwrap();
+        assert!(overview.archives.iter().any(|a| a.month == old && a.pinned));
+        let due = overview.due.iter().find(|d| d.month == old).unwrap();
+        assert!(due.blocked.as_deref().unwrap().contains("pinned"));
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_existing_archive_is_never_overwritten() {
+        let e = env("existing").await;
+        let jobs = Jobs::default();
+        let old = plan::cutoff_month(now(), 3);
+
+        // A tar already there, as if a previous tool wrote it.
+        let dest = e.root.join("archive/Front Door").join(format!("{old}.tar"));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"not really a tar").unwrap();
+
+        let rx = jobs.progress.subscribe();
+        run_archive(
+            ctx(&e, &jobs),
+            e.settings.clone(),
+            vec![CameraMonth { camera: "Front Door".into(), month: old.clone() }],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let done = wait_for_finish(&jobs, rx).await;
+
+        assert!(done.message.unwrap().contains("skipped"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"not really a tar");
+        // Crucially, the sources were not deleted on the strength of an
+        // archive we did not write and have not verified.
+        assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_one_job_runs_at_a_time() {
+        let e = env("lock").await;
+        let jobs = Jobs::default();
+        let held = jobs.lock.clone().lock_owned().await;
+
+        let result =
+            run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false).await;
+        assert!(result.is_err(), "a second job must be refused, not queued");
+        drop(held);
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+}

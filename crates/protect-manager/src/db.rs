@@ -101,6 +101,61 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // One row per archive we know about, keyed by the camera-month it holds.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS archives (
+            camera      TEXT NOT NULL,
+            month       TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            size_bytes  INTEGER NOT NULL DEFAULT 0,
+            file_count  INTEGER NOT NULL DEFAULT 0,
+            created     REAL,
+            verified_at REAL,
+            verify_ok   INTEGER,
+            -- Restored back to live. The scheduler skips pinned months, or it
+            -- would re-archive them on its next pass and undo the restore.
+            pinned      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (camera, month)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS archive_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind         TEXT NOT NULL,
+            status       TEXT NOT NULL,
+            camera       TEXT,
+            month        TEXT,
+            started      REAL NOT NULL,
+            finished     REAL,
+            dry_run      INTEGER NOT NULL DEFAULT 0,
+            scheduled    INTEGER NOT NULL DEFAULT 0,
+            files_total  INTEGER NOT NULL DEFAULT 0,
+            files_done   INTEGER NOT NULL DEFAULT 0,
+            bytes_total  INTEGER NOT NULL DEFAULT 0,
+            message      TEXT,
+            failed_files TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS runs_started ON archive_runs (started DESC)")
+        .execute(pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schedule (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            json        TEXT NOT NULL,
+            last_run    REAL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS index_state (
             id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -112,6 +167,32 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Mark any run still recorded as in-progress as interrupted.
+///
+/// Called once at startup. A process that dies mid-archive leaves a row that
+/// says "running" forever, and a history that lies about the present is worse
+/// than one that admits a gap. Sources are never deleted before verification,
+/// so an interrupted run leaves the originals intact.
+pub async fn reconcile_interrupted_runs(pool: &SqlitePool) {
+    match sqlx::query(
+        "UPDATE archive_runs
+            SET status = 'interrupted',
+                finished = ?,
+                message = COALESCE(message, 'stopped when the app restarted')
+          WHERE status = 'running'",
+    )
+    .bind(now() as f64)
+    .execute(pool)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::warn!("marked {} interrupted run(s) from a previous start", r.rows_affected())
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("could not reconcile interrupted runs: {e}"),
+    }
 }
 
 /// Record a failed sync without disturbing the index it failed to replace.

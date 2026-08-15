@@ -7,6 +7,7 @@ import { LoginPage } from "@/features/auth/LoginPage";
 import { SetupWizard } from "@/features/setup/SetupWizard";
 import { OverviewPage } from "@/features/overview/OverviewPage";
 import { EventsPage } from "@/features/events/EventsPage";
+import { ArchivePage } from "@/features/archive/ArchivePage";
 import { LogsPage } from "@/features/logs/LogsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { Placeholder } from "@/features/placeholder";
@@ -73,16 +74,7 @@ export function App() {
               />
             }
           />
-          <Route
-            path="/archive"
-            element={
-              <Placeholder
-                title="Archive"
-                description="What has been archived, what is due, and running an archive on demand or on a schedule."
-                waitingOn="the archive runner"
-              />
-            }
-          />
+          <Route path="/archive" element={<ArchivePage />} />
           <Route
             path="/storage"
             element={

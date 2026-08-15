@@ -21,6 +21,8 @@ pub struct Config {
     pub password_hash: Option<String>,
     /// Mount point of the backup root inside *this* container.
     pub backup_dir: PathBuf,
+    /// Where archives are written. Must be writable, unlike the backup root.
+    pub archive_dir: PathBuf,
     /// Image substring used to find the backup container.
     pub upb_image: String,
     /// Explicit container id/name, bypassing discovery. Escape hatch only.
@@ -59,6 +61,9 @@ impl Config {
                 .filter(|s| !s.is_empty()),
             backup_dir: std::env::var("PM_BACKUP_DIR")
                 .unwrap_or_else(|_| "/backup".into())
+                .into(),
+            archive_dir: std::env::var("PM_ARCHIVE_DIR")
+                .unwrap_or_else(|_| "/archive".into())
                 .into(),
             upb_image: std::env::var("PM_UPB_IMAGE")
                 .unwrap_or_else(|_| DEFAULT_UPB_IMAGE.into()),

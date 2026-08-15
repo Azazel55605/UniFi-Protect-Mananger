@@ -143,7 +143,16 @@ pub struct Settings {
     pub camera_dirs: Vec<String>,
     /// How long clips stay viewable. The same number decides when they are
     /// archived — one knob, phrased the way the user thinks about it.
+    #[ts(type = "number")]
     pub live_window_months: u32,
+    /// Keep the originals after an archive verifies clean.
+    ///
+    /// Defaults to false — the sources are removed — because the backup
+    /// service never deletes anything itself, so nothing else on the system
+    /// bounds disk growth. Turning this on means the live directory grows
+    /// forever, which is a legitimate choice but has to be a deliberate one.
+    #[serde(default)]
+    pub keep_sources_after_archive: bool,
     pub setup_complete: bool,
 }
 
@@ -295,6 +304,182 @@ pub struct EventQuery {
     #[ts(optional)]
     #[ts(type = "number | null")]
     pub offset: Option<i64>,
+}
+
+// -------------------------------------------------------------- archive
+
+/// A camera-month: the unit everything here operates on, because archives are
+/// one tar per camera per calendar month.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct CameraMonth {
+    pub camera: String,
+    /// `YYYY-MM`.
+    pub month: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub enum RunKind {
+    Archive,
+    Restore,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub enum RunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    /// The process stopped mid-run. Detected at startup, never left as
+    /// "running" — a row that claims to be in progress forever is a lie.
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct ArchiveRun {
+    #[ts(type = "number")]
+    pub id: i64,
+    pub kind: RunKind,
+    pub status: RunStatus,
+    /// Absent for a run that covered several camera-months.
+    pub camera: Option<String>,
+    pub month: Option<String>,
+    pub started: f64,
+    pub finished: Option<f64>,
+    /// True when nothing was written or deleted.
+    pub dry_run: bool,
+    /// Whether a schedule started this, rather than a person.
+    pub scheduled: bool,
+    #[ts(type = "number")]
+    pub files_total: i64,
+    #[ts(type = "number")]
+    pub files_done: i64,
+    #[ts(type = "number")]
+    pub bytes_total: i64,
+    pub message: Option<String>,
+    /// Files whose content did not survive the round trip. Empty on success,
+    /// and the reason sources are still on disk when it isn't.
+    pub failed_files: Vec<String>,
+}
+
+/// An archive on disk, as far as we know it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct ArchiveEntry {
+    pub camera: String,
+    pub month: String,
+    pub path: String,
+    #[ts(type = "number")]
+    pub size_bytes: i64,
+    #[ts(type = "number")]
+    pub file_count: i64,
+    pub created: Option<f64>,
+    pub verified_at: Option<f64>,
+    pub verify_ok: Option<bool>,
+    /// Restored back to live, so the scheduler must leave it alone until
+    /// released — otherwise the next run would immediately re-archive it.
+    pub pinned: bool,
+    /// On disk but with no run history: made by hand, or by whatever managed
+    /// archiving before this app did.
+    pub unrecorded: bool,
+}
+
+/// A camera-month old enough to archive that hasn't been.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct DueEntry {
+    pub camera: String,
+    pub month: String,
+    #[ts(type = "number")]
+    pub file_count: i64,
+    #[ts(type = "number")]
+    pub bytes: i64,
+    /// Why it hasn't been archived, when the answer isn't "not yet".
+    pub blocked: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct ArchiveOverview {
+    pub archives: Vec<ArchiveEntry>,
+    pub due: Vec<DueEntry>,
+    /// Runs whose archive is no longer on disk.
+    pub missing_archives: Vec<CameraMonth>,
+    #[ts(type = "number")]
+    pub total_bytes: i64,
+    pub running: Option<ArchiveRun>,
+}
+
+/// Live progress for a running job.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct RunProgress {
+    #[ts(type = "number")]
+    pub run_id: i64,
+    pub kind: RunKind,
+    /// What is being worked on right now.
+    pub camera: Option<String>,
+    pub month: Option<String>,
+    pub phase: String,
+    pub current_file: Option<String>,
+    /// Progress through the current camera-month.
+    #[ts(type = "number")]
+    pub files_done: i64,
+    #[ts(type = "number")]
+    pub files_total: i64,
+    /// Progress across the whole run, which may span several camera-months.
+    #[ts(type = "number")]
+    pub overall_done: i64,
+    #[ts(type = "number")]
+    pub overall_total: i64,
+    pub finished: bool,
+    pub status: Option<RunStatus>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct StartArchiveRequest {
+    /// Empty means everything currently due.
+    #[serde(default)]
+    pub targets: Vec<CameraMonth>,
+    /// Report what would happen, writing and deleting nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub enum ScheduleKind {
+    Off,
+    /// On a given day of the month.
+    Monthly,
+    /// Every day. Cheap when nothing is due, and keeps a missed month from
+    /// waiting another four weeks.
+    Daily,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = OUT)]
+pub struct Schedule {
+    pub kind: ScheduleKind,
+    /// Day of month for `Monthly`, ignored otherwise.
+    #[ts(type = "number")]
+    pub day: u32,
+    /// Local hour, 0–23.
+    #[ts(type = "number")]
+    pub hour: u32,
+    /// Run as soon as the app starts if the scheduled time was missed while it
+    /// was down. A late archive beats a skipped one.
+    pub catch_up: bool,
+    /// Optional POST on failure, so a silent failure can't hide behind a
+    /// closed browser tab.
+    pub webhook_url: Option<String>,
+    pub next_run: Option<f64>,
+    pub last_run: Option<f64>,
 }
 
 #[cfg(test)]

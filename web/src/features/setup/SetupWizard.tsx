@@ -41,6 +41,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
           ? saved.camera_dirs
           : discovery.data.cameras.filter((c) => c.looks_like_camera).map((c) => c.dir_name),
       live_window_months: saved.live_window_months || 2,
+      keep_sources_after_archive: saved.keep_sources_after_archive,
       setup_complete: saved.setup_complete,
     });
   }, [draft, existing.data, discovery.data]);

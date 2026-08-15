@@ -6,8 +6,13 @@
  * place — and the app stays portable if it is ever served from somewhere else.
  */
 import type {
+  ArchiveOverview,
+  ArchiveRun,
   AuthStatus,
   CameraInfo,
+  CameraMonth,
+  Schedule,
+  StartArchiveRequest,
   DiscoveryResult,
   EventPage,
   EventQuery,
@@ -91,6 +96,45 @@ export const api = {
 
   indexStats: () =>
     request<{ stats: IndexStats; event_types: string[] }>("/api/index/stats"),
+
+  archive: () => request<ArchiveOverview>("/api/archive"),
+
+  archiveRuns: () => request<ArchiveRun[]>("/api/archive/runs"),
+
+  startArchive: (body: StartArchiveRequest) =>
+    request<{ run_id: number }>("/api/archive/runs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  restore: (target: CameraMonth) =>
+    request<{ run_id: number }>("/api/archive/restore", {
+      method: "POST",
+      body: JSON.stringify(target),
+    }),
+
+  verifyArchive: (target: CameraMonth) =>
+    request<{ run_id: number }>("/api/archive/verify", {
+      method: "POST",
+      body: JSON.stringify(target),
+    }),
+
+  setPinned: (camera: string, month: string, pinned: boolean) =>
+    request<void>("/api/archive/pin", {
+      method: "POST",
+      body: JSON.stringify({ camera, month, pinned }),
+    }),
+
+  schedule: () => request<Schedule>("/api/schedule"),
+
+  saveSchedule: (s: Schedule) =>
+    request<Schedule>("/api/schedule", { method: "PUT", body: JSON.stringify(s) }),
+
+  /** Live progress for archive, restore and verify jobs. */
+  progressSocket: () => {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return new WebSocket(`${proto}//${location.host}/ws/progress`);
+  },
 
   syncIndex: () =>
     request<{ events: number; cameras: number; clips_checked: number }>(

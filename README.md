@@ -29,6 +29,13 @@ storage on a schedule, and see whether the pipeline is actually working.
   never captured, so a gap in the footage is visible rather than silent
 - Backup lag on the dashboard: time since the newest event that produced a
   clip, which catches a backup service that is running but no longer capturing
+- Archiving that packs each camera-month into an uncompressed `.tar`, reads it
+  back and compares every file against its hash, and only then removes the
+  originals — with a dry run that writes nothing
+- A schedule that catches up after downtime instead of skipping, records every
+  attempt, and can POST to a webhook when a run fails
+- An archive browser: what exists, what's due, archives made outside this app,
+  archives that have gone missing, on-demand verification, and restore
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 
@@ -80,7 +87,7 @@ than showing an empty list.
 |---|---|---|
 | ✅ | **Shell, setup and health** | Login, interactive setup, health checks, live container logs |
 | ✅ | **Event feed** | Indexes the backup service's event database, reads camera names and detection types out of clip filenames, filters by camera, type, detection and clip state |
-| ⬜ | **Archiving** | Pack old clips into per-camera monthly archives, verify them before deleting sources, run on a schedule, browse and restore archives |
+| ✅ | **Archiving** | Packs old clips into per-camera monthly archives, verifies every file before deleting anything, runs on a schedule, and browses, verifies and restores archives |
 | ⬜ | **Capacity dashboard** | Pool usage, growth over time, live vs archived split |
 | ⬜ | **Timeline and playback** | Scrubbable timeline with thumbnails; clips are HEVC, so playback transcodes on demand |
 | ⬜ | **Mobile layouts** | Desktop-first for now; the timeline needs a different treatment on a phone |
@@ -96,6 +103,7 @@ than showing an empty list.
 | `PM_UPB_CONTAINER` | — | Explicit container id/name, bypassing discovery |
 | `PM_COOKIE_SECURE` | `true` | Set `0` only for local HTTP development |
 | `PM_SESSION_TTL_SECS` | 14 days | Session lifetime |
+| `PM_ARCHIVE_DIR` | `/archive` | Where `.tar` archives are written |
 | `PM_STATE_DIR` | `/var/lib/protect-manager` | Our database and caches |
 | `PM_STATIC_DIR` | `web/dist` | Where the built frontend is served from |
 | `PM_LOG` | `protect_manager=info` | `tracing` filter |
@@ -120,6 +128,13 @@ deploying this for the first time should not require hand-editing config.
 | `GET /api/cameras` | Known cameras with event counts |
 | `GET /api/index/stats` | Index totals, clip states, backup lag, available filters |
 | `POST /api/index/sync` | Rebuild the index now instead of waiting for the timer |
+| `GET /api/archive` | Archives, what's due, and anything missing |
+| `GET/POST /api/archive/runs` | Run history; start an archive or a dry run |
+| `POST /api/archive/restore` | Unpack a camera-month back to live |
+| `POST /api/archive/verify` | Re-read an existing archive |
+| `POST /api/archive/pin` | Hold a month back from scheduled archiving, or release it |
+| `GET/PUT /api/schedule` | The archive schedule |
+| `GET /ws/progress` | Live job progress (WebSocket) |
 | `GET /ws/logs?tail=N` | Live container logs (WebSocket) |
 
 ## Subcommands
@@ -170,6 +185,19 @@ A few decisions that are easy to mistake for accidents:
   schema has no index on time, so reading "only what's new" scans the same
   rows anyway — and backup rows are written *after* their event, so a
   high-water mark would permanently miss clips that arrived late.
+- **Nothing is deleted until the archive holding it has been read back and
+  compared byte for byte.** Header-only checks catch truncation but pass a
+  structurally valid archive containing wrong bytes, which is the one failure
+  that matters when the originals are about to go.
+- **An archive that already exists is never overwritten**, and its sources are
+  never deleted on the strength of it — we only remove originals for an archive
+  this app wrote and verified in the same run.
+- **Archives are plain uncompressed tar** and stay readable with `tar -xf`.
+  Clips are already compressed video, so gzip would cost CPU for nothing, and
+  the archive should outlive this application.
+- **Restored months are pinned.** A restored month is older than the live
+  window by definition, so the next scheduled run would immediately archive it
+  again and undo the restore.
 - **The upstream database is only ever opened read-only, and never on the
   request path.** It uses a rollback journal, so a reader can block while it
   writes; that is fine on a background timer and not fine while someone waits
