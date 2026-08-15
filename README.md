@@ -34,8 +34,11 @@ storage on a schedule, and see whether the pipeline is actually working.
   originals — with a dry run that writes nothing
 - A schedule that catches up after downtime instead of skipping, records every
   attempt, and can POST to a webhook when a run fails
-- An archive browser: what exists, what's due, archives made outside this app,
-  archives that have gone missing, on-demand verification, and restore
+- An archive browser grouped by camera: what exists, what's due, archives made
+  outside this app, archives that have gone missing, on-demand verification,
+  and restore
+- A running job stays visible from any page, so archiving a few months doesn't
+  pin you to one screen
 - Light and dark themes (following the system by default) and five accent
   colours, applied before first paint so opening the app never flickers
 

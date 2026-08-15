@@ -258,6 +258,15 @@
     -webkit-backdrop-filter: blur(20px) saturate(1.4);
   }
 
+  /* Overlays sit on top of content rather than on the page background, so
+     they need far more opacity than a panel does — at panel transparency the
+     text underneath shows straight through and neither layer is readable. */
+  .glass-overlay {
+    background: color-mix(in srgb, var(--panel) 97%, transparent);
+    backdrop-filter: blur(20px) saturate(1.3);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+  }
+
   /* Long-form monospace stays fully opaque. Blurred backgrounds under dense
      small text cost more legibility than they buy in atmosphere. */
   .surface-solid {

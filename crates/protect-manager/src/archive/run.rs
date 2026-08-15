@@ -37,6 +37,29 @@ fn now() -> f64 {
     crate::upb::reconcile::now_secs()
 }
 
+/// Say that a job has started before doing anything slow.
+///
+/// Reading an archive's index means walking every header, which on a large tar
+/// takes long enough that the UI would otherwise sit blank and look broken.
+/// The first thing a job does is announce itself.
+fn announce(jobs: &Jobs, run_id: i64, kind: RunKind, target: Option<&CameraMonth>, phase: &str) {
+    let _ = jobs.progress.send(RunProgress {
+        run_id,
+        kind,
+        camera: target.map(|t| t.camera.clone()),
+        month: target.map(|t| t.month.clone()),
+        phase: phase.into(),
+        current_file: None,
+        files_done: 0,
+        files_total: 0,
+        overall_done: 0,
+        overall_total: 0,
+        finished: false,
+        status: None,
+        message: None,
+    });
+}
+
 fn kind_str(k: RunKind) -> &'static str {
     match k {
         RunKind::Archive => "archive",
@@ -286,6 +309,17 @@ pub async fn due_months(
     Ok(due)
 }
 
+/// The oldest camera-month present on disk, whether or not it is due.
+fn oldest_month(settings: &Settings, backup_dir: &Path) -> Option<CameraMonth> {
+    settings
+        .camera_dirs
+        .iter()
+        .flat_map(|c| plan::months_for_camera(backup_dir, c))
+        .filter(|m| !m.files.is_empty())
+        .min_by(|a, b| a.month.cmp(&b.month))
+        .map(|m| m.key())
+}
+
 // ------------------------------------------------------------------ jobs
 
 pub struct JobContext {
@@ -320,6 +354,23 @@ pub async fn run_archive(
         targets
     };
 
+    // A dry run with nothing due would otherwise do nothing at all, which is
+    // useless precisely when you want to test the mechanism — most of the
+    // time nothing *is* due. Preview the oldest month instead; a dry run
+    // writes and deletes nothing either way.
+    let mut previewing_not_due = false;
+    let selected = if selected.is_empty() && dry_run {
+        match oldest_month(&settings, &ctx.backup_dir) {
+            Some(m) => {
+                previewing_not_due = true;
+                vec![m]
+            }
+            None => anyhow::bail!("there are no clips to preview"),
+        }
+    } else {
+        selected
+    };
+
     if selected.is_empty() {
         anyhow::bail!("nothing to archive");
     }
@@ -345,19 +396,29 @@ pub async fn run_archive(
     )
     .await?;
 
+    announce(&ctx.jobs, run_id, RunKind::Archive, single.as_ref(), "preparing");
+
     tokio::spawn(async move {
         let _guard = guard;
         let result =
             archive_months(&ctx, &settings, run_id, months, overall_total, dry_run).await;
 
         let (status, message, done, bytes, failed) = match result {
-            Ok(o) => (
-                if o.failed.is_empty() { RunStatus::Succeeded } else { RunStatus::Failed },
-                Some(o.message),
-                o.done,
-                o.bytes,
-                o.failed,
-            ),
+            Ok(o) => {
+                let mut message = o.message;
+                if previewing_not_due {
+                    message.push_str(
+                        " (nothing is due yet, so this previewed the oldest month)",
+                    );
+                }
+                (
+                    if o.failed.is_empty() { RunStatus::Succeeded } else { RunStatus::Failed },
+                    Some(message),
+                    o.done,
+                    o.bytes,
+                    o.failed,
+                )
+            }
             Err(e) => (RunStatus::Failed, Some(e.to_string()), 0, 0, Vec::new()),
         };
 
@@ -614,29 +675,33 @@ pub async fn run_restore(ctx: JobContext, target: CameraMonth) -> anyhow::Result
         anyhow::bail!("no archive at {}", archive.display());
     }
 
+    let run_id = start_run(&ctx.pool, RunKind::Restore, Some(&target), false, false, 0).await?;
+    announce(&ctx.jobs, run_id, RunKind::Restore, Some(&target), "reading archive index");
+
     // Restoring writes back everything the archive holds, so refusing early
-    // beats filling the disk halfway through.
-    let entries = pack::list(&archive)?;
+    // beats filling the disk halfway through. Walking the headers of a large
+    // tar is slow, so it happens off the async runtime — doing it inline
+    // stalls every other request while it runs.
+    let index_path = archive.clone();
+    let entries = tokio::task::spawn_blocking(move || pack::list(&index_path)).await??;
     let needed: u64 = entries.iter().map(|(_, size)| size).sum();
     if let Some(free) = free_space(&ctx.backup_dir) {
         if free < needed + needed / 10 {
-            anyhow::bail!(
+            let msg = format!(
                 "restoring needs about {} MB but only {} MB is free",
                 needed / 1_048_576,
                 free / 1_048_576
             );
+            finish_run(&ctx.pool, run_id, RunStatus::Failed, Some(msg.clone()), 0, 0, &[]).await;
+            anyhow::bail!(msg);
         }
     }
 
-    let run_id = start_run(
-        &ctx.pool,
-        RunKind::Restore,
-        Some(&target),
-        false,
-        false,
-        entries.len() as i64,
-    )
-    .await?;
+    let _ = sqlx::query("UPDATE archive_runs SET files_total = ? WHERE id = ?")
+        .bind(entries.len() as i64)
+        .bind(run_id)
+        .execute(&ctx.pool)
+        .await;
 
     tokio::spawn(async move {
         let _guard = guard;
@@ -721,6 +786,7 @@ pub async fn run_verify(ctx: JobContext, target: CameraMonth) -> anyhow::Result<
     }
 
     let run_id = start_run(&ctx.pool, RunKind::Verify, Some(&target), false, false, 0).await?;
+    announce(&ctx.jobs, run_id, RunKind::Verify, Some(&target), "reading archive index");
 
     tokio::spawn(async move {
         let _guard = guard;
@@ -1051,6 +1117,67 @@ mod tests {
         // Crucially, the sources were not deleted on the strength of an
         // archive we did not write and have not verified.
         assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_previews_the_oldest_month_when_nothing_is_due() {
+        // Most of the time nothing is due, and a dry run that did nothing then
+        // would be useless exactly when you want to test the mechanism.
+        let e = env("preview").await;
+        let mut settings = e.settings.clone();
+        settings.live_window_months = 120; // nothing can possibly be due
+
+        let jobs = Jobs::default();
+        let rx = jobs.progress.subscribe();
+        run_archive(ctx(&e, &jobs), settings, Vec::new(), true, false).await.unwrap();
+        let done = wait_for_finish(&jobs, rx).await;
+
+        assert_eq!(done.status, Some(RunStatus::Succeeded));
+        let message = done.message.unwrap();
+        assert!(message.contains("previewed the oldest month"), "{message}");
+        // Still a dry run: nothing written, nothing deleted.
+        assert!(!e.root.join("archive").exists());
+        let old = plan::cutoff_month(now(), 3);
+        assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_real_run_with_nothing_due_does_not_invent_work() {
+        // The fallback is a dry-run affordance only. A real run must never
+        // archive a month that is still inside the live window.
+        let e = env("nodue").await;
+        let mut settings = e.settings.clone();
+        settings.live_window_months = 120;
+
+        let jobs = Jobs::default();
+        let result = run_archive(ctx(&e, &jobs), settings, Vec::new(), false, false).await;
+        assert!(result.is_err(), "a real run must refuse rather than pick a month itself");
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_announces_itself_before_the_slow_part() {
+        // Reading a large archive's index takes long enough that silence looks
+        // like a hang; the first message must arrive immediately.
+        let e = env("announce").await;
+        let jobs = Jobs::default();
+        let mut rx = jobs.progress.subscribe();
+
+        run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), true, false)
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no progress arrived")
+            .unwrap();
+        assert_eq!(first.phase, "preparing");
+        assert!(!first.finished);
 
         std::fs::remove_dir_all(&e.root).unwrap();
     }

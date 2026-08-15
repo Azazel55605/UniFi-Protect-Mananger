@@ -5,8 +5,14 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import { Tally } from "@/components/ui/tally";
-import type { ArchiveEntry, CameraMonth, DueEntry, RunStatus } from "@/lib/types.gen";
-import { useProgress } from "./useProgress";
+import type {
+  ArchiveEntry,
+  CameraMonth,
+  DueEntry,
+  RunProgress,
+  RunStatus,
+} from "@/lib/types.gen";
+import { useProgress, useProgressPercent } from "@/lib/progress";
 import { SchedulePanel } from "./SchedulePanel";
 
 export function ArchivePage() {
@@ -40,7 +46,7 @@ export function ArchivePage() {
 
   return (
     <div className="max-w-5xl space-y-4">
-      {progress && <ProgressPanel />}
+      {progress && <ProgressPanel progress={progress} />}
 
       {missing.length > 0 && (
         <Panel className="border-bad/40">
@@ -146,11 +152,11 @@ export function ArchivePage() {
             <p className="text-sm text-fg-dim">No archives yet.</p>
           </PanelBody>
         ) : (
-          <ul className="divide-y divide-line">
-            {archives.map((a) => (
-              <ArchiveRow key={`${a.camera}/${a.month}`} entry={a} busy={busy} />
+          <div className="divide-y divide-line">
+            {groupByCamera(archives).map(([camera, entries]) => (
+              <CameraGroup key={camera} camera={camera} entries={entries} busy={busy} />
             ))}
-          </ul>
+          </div>
         )}
       </Panel>
 
@@ -200,18 +206,8 @@ export function ArchivePage() {
   );
 }
 
-function ProgressPanel() {
-  const progress = useProgress();
-  if (!progress) return null;
-
-  const pct =
-    progress.overall_total > 0
-      ? Math.round((progress.overall_done / progress.overall_total) * 100)
-      : 0;
-  const filePct =
-    progress.files_total > 0
-      ? Math.round((progress.files_done / progress.files_total) * 100)
-      : 0;
+function ProgressPanel({ progress }: { progress: RunProgress }) {
+  const pct = useProgressPercent(progress);
 
   return (
     <Panel className="border-signal/40">
@@ -228,8 +224,18 @@ function ProgressPanel() {
       <PanelBody className="space-y-3">
         {/* Two bars, matching how the job actually decomposes: the current
             camera-month, and the run as a whole. */}
-        <Bar label="This month" pct={filePct} done={progress.files_done} total={progress.files_total} />
-        <Bar label="Overall" pct={pct} done={progress.overall_done} total={progress.overall_total} />
+        <Bar
+          label="This month"
+          pct={pct.file}
+          done={progress.files_done}
+          total={progress.files_total}
+        />
+        <Bar
+          label="Overall"
+          pct={pct.overall}
+          done={progress.overall_done}
+          total={progress.overall_total}
+        />
         <p className="data truncate text-[11px] text-fg-faint">
           {progress.message ?? progress.current_file ?? ""}
         </p>
@@ -278,6 +284,61 @@ function BlockedRow({ entry }: { entry: DueEntry }) {
   );
 }
 
+/** Archives belong to a camera first and a month second, which is how you
+ *  look for them: "what do I have from the back door?" before "which month?" */
+function groupByCamera(entries: ArchiveEntry[]): [string, ArchiveEntry[]][] {
+  const groups = new Map<string, ArchiveEntry[]>();
+  for (const e of entries) {
+    const list = groups.get(e.camera) ?? [];
+    list.push(e);
+    groups.set(e.camera, list);
+  }
+  for (const list of groups.values()) list.sort((a, b) => b.month.localeCompare(a.month));
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function CameraGroup({
+  camera,
+  entries,
+  busy,
+}: {
+  camera: string;
+  entries: ArchiveEntry[];
+  busy: boolean;
+}) {
+  const [open, setOpen] = useState(true);
+  const bytes = entries.reduce((sum, e) => sum + e.size_bytes, 0);
+  const span =
+    entries.length > 1
+      ? `${entries[entries.length - 1]!.month} – ${entries[0]!.month}`
+      : (entries[0]?.month ?? "");
+
+  return (
+    <div>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-raised/40"
+      >
+        <span className="data w-3 flex-none text-fg-faint">{open ? "−" : "+"}</span>
+        <span className="flex-1 truncate text-sm font-medium">{camera}</span>
+        <span className="data text-[11px] text-fg-faint">{span}</span>
+        <span className="data w-28 text-right text-fg-dim">
+          {entries.length} {entries.length === 1 ? "month" : "months"}
+        </span>
+        <span className="data w-24 text-right text-fg-faint">{formatBytes(bytes)}</span>
+      </button>
+
+      {open && (
+        <ul className="divide-y divide-line border-t border-line bg-ink/20">
+          {entries.map((e) => (
+            <ArchiveRow key={`${e.camera}/${e.month}`} entry={e} busy={busy} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
@@ -309,8 +370,7 @@ function ArchiveRow({ entry, busy }: { entry: ArchiveEntry; busy: boolean }) {
           state={entry.verify_ok === false ? "bad" : entry.verify_ok ? "ok" : "idle"}
           className="flex-none"
         />
-        <span className="w-40 flex-none truncate text-sm">{entry.camera}</span>
-        <span className="data w-20 flex-none text-fg-dim">{entry.month}</span>
+        <span className="data w-20 flex-none pl-4 text-fg">{entry.month}</span>
         <span className="data w-24 flex-none text-right text-fg-faint">
           {formatBytes(entry.size_bytes)}
         </span>

@@ -11,6 +11,7 @@ import { ArchivePage } from "@/features/archive/ArchivePage";
 import { LogsPage } from "@/features/logs/LogsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { Placeholder } from "@/features/placeholder";
+import { ProgressProvider } from "@/lib/progress";
 
 export function App() {
   const [reconfiguring, setReconfiguring] = useState(false);
@@ -59,8 +60,9 @@ export function App() {
   }
 
   return (
-    <BrowserRouter>
-      <AppShell>
+    <ProgressProvider>
+      <BrowserRouter>
+        <AppShell>
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/events" element={<EventsPage />} />
@@ -92,8 +94,9 @@ export function App() {
           />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-      </AppShell>
-    </BrowserRouter>
+        </AppShell>
+      </BrowserRouter>
+    </ProgressProvider>
   );
 }
 

@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Tally, type TallyState } from "./ui/tally";
 import { ThemeSwitch } from "./AppearanceControls";
+import { ProgressBubble } from "./ProgressBubble";
 
 type NavItem = { to: string; label: string; ready: boolean };
 
@@ -128,6 +129,8 @@ export function AppShell({ children }: { children: ReactNode }) {
         </header>
         <main className="min-w-0 flex-1 overflow-y-auto p-6">{children}</main>
       </div>
+
+      <ProgressBubble />
     </div>
   );
 }
