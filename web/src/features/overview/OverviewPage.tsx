@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Panel, PanelBody, PanelHeader } from "@/components/ui/panel";
 import { Tally } from "@/components/ui/tally";
+import { formatBytes } from "@/lib/format";
 import type { Check, IndexStats } from "@/lib/types.gen";
 
 export function OverviewPage() {
@@ -11,6 +12,12 @@ export function OverviewPage() {
     queryKey: ["index-stats"],
     queryFn: api.indexStats,
     refetchInterval: 30_000,
+  });
+  // Shares its cache key with the Capacity page, so opening one warms the other.
+  const storage = useQuery({
+    queryKey: ["storage"],
+    queryFn: api.storage,
+    refetchInterval: 60_000,
   });
 
   if (health.isError) {
@@ -79,7 +86,7 @@ export function OverviewPage() {
       {index.data && index.data.stats.total_events > 0 && (
         <Panel className="lg:col-span-2">
           <PanelHeader label="Footage" aside={<SyncAge stats={index.data.stats} />} />
-          <PanelBody className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+          <PanelBody className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
             <Stat
               label="Last captured"
               value={formatLag(index.data.stats.backup_lag_secs)}
@@ -97,6 +104,20 @@ export function OverviewPage() {
               hint={
                 `${index.data.stats.pending_backfill} may still be fetched · ` +
                 `${index.data.stats.never_backed_up} never will be`
+              }
+            />
+            <Stat
+              label="Footage held"
+              value={
+                storage.data
+                  ? formatBytes(storage.data.live_bytes + storage.data.archive_bytes)
+                  : "…"
+              }
+              hint={
+                storage.data
+                  ? `${formatBytes(storage.data.live_bytes)} live · ` +
+                    `${formatBytes(storage.data.archive_bytes)} archived`
+                  : undefined
               }
             />
           </PanelBody>
