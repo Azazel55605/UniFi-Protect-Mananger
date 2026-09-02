@@ -113,6 +113,31 @@ async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     // One row per archive we know about, keyed by the camera-month it holds.
+    // How far a partially written archive got, one row per day packed.
+    //
+    // The unit is a day because that is the unit of work worth not repeating:
+    // a camera-month here runs to tens or hundreds of gigabytes, and being
+    // killed halfway through one meant packing all of it again. `end_offset`
+    // is the byte position in the `.tar.partial` *before* its trailer, so it
+    // is always a real entry boundary — a resume truncates back to a position
+    // we wrote, never to one we guessed.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS archive_progress (
+            camera      TEXT NOT NULL,
+            month       TEXT NOT NULL,
+            day         TEXT NOT NULL,
+            end_offset  INTEGER NOT NULL,
+            -- That day's entry names and content hashes, so verification after
+            -- a resume still compares against hashes taken when the bytes were
+            -- read from the source, not ones re-derived from the archive.
+            hashes      TEXT NOT NULL,
+            updated     REAL NOT NULL,
+            PRIMARY KEY (camera, month, day)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS archives (
             camera      TEXT NOT NULL,
@@ -292,6 +317,99 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------- archive resume
+
+/// One day already packed into a partial archive.
+#[derive(Debug, Clone)]
+pub struct DayCheckpoint {
+    pub day: String,
+    pub end_offset: u64,
+    pub hashes: std::collections::BTreeMap<String, String>,
+}
+
+/// Record that a day is durably in the partial archive.
+///
+/// Written *after* the bytes are flushed and synced, never before: recording
+/// late costs one repeated day, recording early would skip a day that is not
+/// actually in the archive and then delete its originals.
+pub async fn save_checkpoint(
+    pool: &SqlitePool,
+    camera: &str,
+    month: &str,
+    day: &str,
+    end_offset: u64,
+    hashes: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string(hashes)?;
+    sqlx::query(
+        "INSERT INTO archive_progress (camera, month, day, end_offset, hashes, updated)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(camera, month, day) DO UPDATE SET
+            end_offset = excluded.end_offset, hashes = excluded.hashes,
+            updated = excluded.updated",
+    )
+    .bind(camera)
+    .bind(month)
+    .bind(day)
+    .bind(end_offset as i64)
+    .bind(json)
+    .bind(now() as f64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every day already packed for a camera-month, oldest first.
+pub async fn load_checkpoints(
+    pool: &SqlitePool,
+    camera: &str,
+    month: &str,
+) -> Vec<DayCheckpoint> {
+    let rows = sqlx::query(
+        "SELECT day, end_offset, hashes FROM archive_progress
+          WHERE camera = ? AND month = ? ORDER BY day",
+    )
+    .bind(camera)
+    .bind(month)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .filter_map(|r| {
+            let raw: String = r.get("hashes");
+            // A row we cannot read is a row we cannot trust to say what is in
+            // the archive, so it is dropped rather than half-believed — the
+            // day is simply packed again.
+            let hashes = serde_json::from_str(&raw).ok()?;
+            Some(DayCheckpoint {
+                day: r.get("day"),
+                end_offset: r.get::<i64, _>("end_offset").max(0) as u64,
+                hashes,
+            })
+        })
+        .collect()
+}
+
+pub async fn clear_checkpoints(pool: &SqlitePool, camera: &str, month: &str) {
+    let _ = sqlx::query("DELETE FROM archive_progress WHERE camera = ? AND month = ?")
+        .bind(camera)
+        .bind(month)
+        .execute(pool)
+        .await;
+}
+
+/// Camera-months with checkpoints recorded, for the startup sweep.
+pub async fn checkpointed_months(pool: &SqlitePool) -> Vec<(String, String)> {
+    sqlx::query("SELECT DISTINCT camera, month FROM archive_progress")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r.get("camera"), r.get("month")))
+        .collect()
 }
 
 // ------------------------------------------------------------- settings

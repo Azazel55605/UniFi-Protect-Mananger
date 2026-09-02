@@ -128,6 +128,11 @@ pub struct Check {
 #[ts(export, export_to = OUT)]
 pub struct Health {
     pub ok: bool,
+    /// The build's own version, so what is deployed can be read off the
+    /// interface rather than inferred from an image tag. On `Health` rather
+    /// than the unauthenticated status endpoint: it is a small thing to hand a
+    /// stranger, and there is no reason to.
+    pub version: String,
     pub docker: Check,
     pub container: Check,
     pub backup_dir: Check,

@@ -221,7 +221,14 @@ path: string, total_bytes: number, free_bytes: number,
  */
 device: number, };
 
-export type Health = { ok: boolean, docker: Check, container: Check, backup_dir: Check, 
+export type Health = { ok: boolean, 
+/**
+ * The build's own version, so what is deployed can be read off the
+ * interface rather than inferred from an image tag. On `Health` rather
+ * than the unauthenticated status endpoint: it is a small thing to hand a
+ * stranger, and there is no reason to.
+ */
+version: string, docker: Check, container: Check, backup_dir: Check, 
 /**
  * Whether archives can actually be written. Separate from `backup_dir`
  * because they fail for opposite reasons: the clip directory needs to be

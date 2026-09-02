@@ -40,6 +40,14 @@ storage on a schedule, and see whether the pipeline is actually working.
 - Archiving that packs each camera-month into an uncompressed `.tar`, reads it
   back and compares every file against its hash, and only then removes the
   originals — with a dry run that writes nothing
+- Archive runs that resume rather than restart: each day is checkpointed once
+  its bytes are flushed, so a container restart part-way through a
+  hundred-gigabyte month costs one day of packing instead of all of it. The
+  archive layout is unchanged, and the partial is a valid tar at every
+  checkpoint
+- A clean stop on SIGTERM, so a redeploy lets the current day finish rather
+  than killing it mid-write, and abandoned partial archives are swept at
+  startup instead of quietly occupying a month of disk each
 - A schedule that catches up after downtime instead of skipping, records every
   attempt, and can POST to a webhook when a run fails
 - An archive browser grouped by camera: what exists, what's due, archives made
@@ -193,9 +201,25 @@ deploying this for the first time should not require hand-editing config.
 | `hash-password <password>` | Generate a value for `PM_PASSWORD_HASH` |
 | `check-hash` | Report the structure of the configured hash and diagnose a mangled one |
 | `verify-password <password>` | Test a password against the configured hash |
+| `doctor` | Report the clip and archive directories as this process sees them |
 
 `check-hash` and `verify-password` read `PM_PASSWORD_HASH` from the environment,
 so run them inside the deployed container to see what the server actually got.
+
+`doctor` exists for the same reason. When an archive run fails with a permission
+error, the host and the container often disagree about what is there — different
+uid, different supplementary groups, a bind mount that is read-only or points
+somewhere other than you think, an ACL the mode bits do not show. It prints, per
+directory, the owner and mode, the mount it lives on and whether that mount is
+read-only, the result of an actual write, and what to change:
+
+```
+docker compose exec protect-manager protect-manager doctor
+```
+
+If a write fails while the mode plainly permits it, the mode is not what is
+denying it — on ZFS/TrueNAS an NFSv4 ACL on the dataset overrides the POSIX bits
+and `chmod` does not touch it. `doctor` says so rather than repeating the errno.
 
 Everything except the auth endpoints requires a session.
 

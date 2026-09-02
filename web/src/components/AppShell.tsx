@@ -129,6 +129,15 @@ export function AppShell({ children }: { children: ReactNode }) {
           <span className="text-[13px] font-semibold tracking-[0.12em] uppercase">
             Protect
           </span>
+          {/* Baseline-aligned with the wordmark and dimmed: it is the answer to
+              "which build is this" when something looks wrong, not a thing to
+              read on the way past. Absent until health has answered rather
+              than a placeholder, so it is never briefly wrong. */}
+          {health.data && (
+            <span className="data text-[11px] text-fg-faint" title="Version of this build">
+              v{health.data.version}
+            </span>
+          )}
           <button
             onClick={() => setNavOpen(false)}
             aria-label="Close navigation"

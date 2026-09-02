@@ -12,12 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::plan::MonthContents;
 
 /// Reported per file so a caller can drive a progress bar without knowing how
 /// archiving works.
@@ -25,12 +24,6 @@ pub struct FileProgress<'a> {
     pub index: usize,
     pub total: usize,
     pub name: &'a str,
-}
-
-pub struct PackResult {
-    pub bytes_written: u64,
-    /// Entry name to content hash, kept for verification.
-    pub hashes: BTreeMap<String, String>,
 }
 
 fn hash_reader<R: Read>(mut r: R, sink: Option<&mut dyn Write>) -> std::io::Result<(String, u64)> {
@@ -55,28 +48,63 @@ fn hash_reader<R: Read>(mut r: R, sink: Option<&mut dyn Write>) -> std::io::Resu
     Ok((hex, total))
 }
 
-/// Write a camera-month into a tar, hashing each file as it goes.
+/// Where a camera-month's archive is assembled before it is complete.
+///
+/// A separate name so an interrupted run never leaves something that looks
+/// like a finished archive — and, now that runs resume, so the work in
+/// progress is findable again rather than being anonymous rubble.
+pub fn partial_path(dest: &Path) -> PathBuf {
+    dest.with_extension("tar.partial")
+}
+
+/// What one appended group of files added to a partial archive.
+pub struct DayPack {
+    /// Byte offset of the end of the last entry, *before* the tar trailer.
+    ///
+    /// This is the resume point, and it is a position we wrote rather than one
+    /// we searched for: appending later means truncating back to exactly here,
+    /// which is by construction a record boundary.
+    pub end_offset: u64,
+    pub hashes: BTreeMap<String, String>,
+}
+
+/// Append files to a partial archive, hashing each as it goes.
 ///
 /// Uncompressed, matching the existing archives — and worth keeping that way:
 /// clips are already compressed video, so gzip would burn CPU for nothing.
-pub fn pack(
-    month: &MonthContents,
-    dest: &Path,
+///
+/// Everything past `start_offset` is discarded first. On a fresh start that is
+/// a no-op; on a resume it removes both the previous trailer and any partial
+/// record from the write that was interrupted. Either way the archive is
+/// extended from a known-good boundary.
+///
+/// The trailer is rewritten after every call, so the partial is a *valid tar*
+/// at every checkpoint rather than only at the end — an interrupted run leaves
+/// a readable archive of the days that made it, not a torn file.
+pub fn append_day(
+    partial: &Path,
+    start_offset: u64,
+    files: &[(PathBuf, String)],
     mut on_file: impl FnMut(FileProgress<'_>),
-) -> anyhow::Result<PackResult> {
-    if let Some(parent) = dest.parent() {
+) -> anyhow::Result<DayPack> {
+    if let Some(parent) = partial.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Write to a temporary name and rename on success, so an interrupted run
-    // never leaves something that looks like a finished archive.
-    let tmp = dest.with_extension("tar.partial");
-    let file = File::create(&tmp)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(partial)?;
+    file.set_len(start_offset)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+
     let mut builder = tar::Builder::new(file);
     let mut hashes = BTreeMap::new();
 
-    let total = month.files.len();
-    for (i, (source, entry_name)) in month.files.iter().enumerate() {
+    let total = files.len();
+    for (i, (source, entry_name)) in files.iter().enumerate() {
         on_file(FileProgress { index: i, total, name: entry_name });
 
         let mut header = tar::Header::new_gnu();
@@ -94,17 +122,26 @@ pub fn pack(
         hashes.insert(entry_name.clone(), hash);
     }
 
+    // Read the position before `into_inner` writes the trailer, so the
+    // recorded offset is where the next append must resume from.
+    let end_offset = builder.get_mut().stream_position()?;
+
     let mut file = builder.into_inner()?;
     file.flush()?;
     // The point of verification is that the bytes reached the disk, so make
-    // sure they have before we read them back.
+    // sure they have before we read them back — and before a checkpoint claims
+    // this day is safely stored.
     file.sync_all()?;
     drop(file);
 
-    let bytes_written = std::fs::metadata(&tmp)?.len();
-    std::fs::rename(&tmp, dest)?;
+    Ok(DayPack { end_offset, hashes })
+}
 
-    Ok(PackResult { bytes_written, hashes })
+/// Promote a finished partial to the archive it was building.
+pub fn finish(partial: &Path, dest: &Path) -> anyhow::Result<u64> {
+    let bytes = std::fs::metadata(partial)?.len();
+    std::fs::rename(partial, dest)?;
+    Ok(bytes)
 }
 
 pub struct VerifyResult {
@@ -235,7 +272,32 @@ pub fn unpack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::plan::months_for_camera;
+    use crate::archive::plan::{months_for_camera, MonthContents};
+
+    /// Pack a whole month the way a run does — day by day, then promote.
+    fn pack_all(
+        month: &MonthContents,
+        dest: &Path,
+        mut on_file: impl FnMut(FileProgress<'_>),
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        let partial = partial_path(dest);
+        let mut offset = 0u64;
+        let mut hashes = BTreeMap::new();
+
+        let mut by_day: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
+        for (path, entry) in &month.files {
+            let day = entry.split('/').next().unwrap_or("").to_string();
+            by_day.entry(day).or_default().push((path.clone(), entry.clone()));
+        }
+
+        for (_, files) in by_day {
+            let packed = append_day(&partial, offset, &files, &mut on_file)?;
+            offset = packed.end_offset;
+            hashes.extend(packed.hashes);
+        }
+        finish(&partial, dest)?;
+        Ok(hashes)
+    }
 
     fn scaffold(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("pm-pack-{}-{name}", std::process::id()));
@@ -258,16 +320,66 @@ mod tests {
         let dest = root.join("archive").join("Front Door").join("2026-06.tar");
 
         let mut seen = 0;
-        let packed = pack(&month, &dest, |_| seen += 1).unwrap();
+        let hashes = pack_all(&month, &dest, |_| seen += 1).unwrap();
         assert_eq!(seen, 4);
-        assert_eq!(packed.hashes.len(), 4);
+        assert_eq!(hashes.len(), 4);
         assert!(dest.is_file());
         // The temporary file must not survive a successful run.
         assert!(!dest.with_extension("tar.partial").exists());
 
-        let result = verify(&dest, &packed.hashes, |_| {}).unwrap();
+        let result = verify(&dest, &hashes, |_| {}).unwrap();
         assert!(result.ok(), "{}", result.summary());
         assert_eq!(result.checked, 4);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn appending_discards_a_torn_tail_and_still_produces_a_valid_archive() {
+        // What a killed process leaves: bytes past the last checkpoint that are
+        // half a record, plus the trailer written at the previous checkpoint.
+        // Resuming truncates back to the recorded offset — a boundary we wrote,
+        // never one we went looking for.
+        let root = scaffold("torn");
+        let month = months_for_camera(&root.join("backup"), "Front Door").remove(0);
+        let dest = root.join("archive").join("Front Door").join("2026-06.tar");
+        let partial = partial_path(&dest);
+
+        let day1: Vec<_> = month
+            .files
+            .iter()
+            .filter(|(_, e)| e.starts_with("2026-06-01"))
+            .cloned()
+            .collect();
+        let day2: Vec<_> = month
+            .files
+            .iter()
+            .filter(|(_, e)| e.starts_with("2026-06-02"))
+            .cloned()
+            .collect();
+
+        let first = append_day(&partial, 0, &day1, |_| {}).unwrap();
+        // At a checkpoint the partial is already a valid tar of what it holds.
+        assert_eq!(list(&partial).unwrap().len(), 2);
+
+        // Now scribble a half-written record onto the end.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&partial).unwrap();
+            f.write_all(&[0xAB; 900]).unwrap();
+        }
+
+        let second = append_day(&partial, first.end_offset, &day2, |_| {}).unwrap();
+        finish(&partial, &dest).unwrap();
+
+        let mut hashes = first.hashes.clone();
+        hashes.extend(second.hashes.clone());
+        assert_eq!(hashes.len(), 4);
+
+        let entries = list(&dest).unwrap();
+        assert_eq!(entries.len(), 4, "no torn record survived: {entries:?}");
+        let result = verify(&dest, &hashes, |_| {}).unwrap();
+        assert!(result.ok(), "{}", result.summary());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -280,9 +392,9 @@ mod tests {
         let root = scaffold("corrupt");
         let month = months_for_camera(&root.join("backup"), "Front Door").remove(0);
         let dest = root.join("archive").join("2026-06.tar");
-        let packed = pack(&month, &dest, |_| {}).unwrap();
+        let hashes = pack_all(&month, &dest, |_| {}).unwrap();
 
-        let mut wrong = packed.hashes.clone();
+        let mut wrong = hashes.clone();
         let key = wrong.keys().next().unwrap().clone();
         wrong.insert(key.clone(), "0".repeat(64));
 
@@ -299,10 +411,10 @@ mod tests {
         let root = scaffold("missing");
         let month = months_for_camera(&root.join("backup"), "Front Door").remove(0);
         let dest = root.join("archive").join("2026-06.tar");
-        let mut packed = pack(&month, &dest, |_| {}).unwrap();
+        let mut hashes = pack_all(&month, &dest, |_| {}).unwrap();
 
-        packed.hashes.insert("2026-06-03/never-written.mp4".into(), "abc".into());
-        let result = verify(&dest, &packed.hashes, |_| {}).unwrap();
+        hashes.insert("2026-06-03/never-written.mp4".into(), "abc".into());
+        let result = verify(&dest, &hashes, |_| {}).unwrap();
         assert!(!result.ok());
         assert_eq!(result.missing, vec!["2026-06-03/never-written.mp4"]);
 
@@ -314,7 +426,7 @@ mod tests {
         let root = scaffold("unpack");
         let month = months_for_camera(&root.join("backup"), "Front Door").remove(0);
         let dest = root.join("archive").join("2026-06.tar");
-        pack(&month, &dest, |_| {}).unwrap();
+        pack_all(&month, &dest, |_| {}).unwrap();
 
         let restored = root.join("restored");
         let count = unpack(&dest, &restored, |_| {}).unwrap();
@@ -332,7 +444,7 @@ mod tests {
         let root = scaffold("list");
         let month = months_for_camera(&root.join("backup"), "Front Door").remove(0);
         let dest = root.join("archive").join("2026-06.tar");
-        pack(&month, &dest, |_| {}).unwrap();
+        pack_all(&month, &dest, |_| {}).unwrap();
 
         let entries = list(&dest).unwrap();
         assert_eq!(entries.len(), 4);

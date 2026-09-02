@@ -94,6 +94,57 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
 
+        // Everything about the directories archiving depends on, as this
+        // process sees them. Run inside the container: a host shell sees a
+        // different uid, different mounts and, on a bind mount, sometimes a
+        // different path — which is exactly how "the host says 777" and "the
+        // container cannot write" coexist.
+        Some("doctor") => {
+            let config = Config::from_env()?;
+            let me = health::Identity::current();
+
+            println!("protect-manager doctor");
+            println!("\nrunning as: {me}");
+            if me.groups.is_empty() {
+                println!("  note: no supplementary groups.");
+                println!(
+                    "        If your compose file lists `group_add`, the container was restarted"
+                );
+                println!("        rather than recreated — `docker compose up -d --force-recreate` fixes that.");
+            }
+
+            for (label, dir) in [
+                ("backup directory (read)", &config.backup_dir),
+                ("archive directory (write)", &config.archive_dir),
+            ] {
+                println!("\n{label}");
+                print!("{}", health::describe(dir).report());
+            }
+
+            // The per-camera directories are where archiving actually writes,
+            // and a writable root says nothing about them.
+            let report = health::describe(&config.archive_dir);
+            if report.writable() {
+                let mut any = false;
+                if let Ok(entries) = std::fs::read_dir(&config.archive_dir) {
+                    for entry in entries.filter_map(Result::ok) {
+                        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            continue;
+                        }
+                        if !any {
+                            println!("\nexisting camera directories");
+                            any = true;
+                        }
+                        print!("{}", health::describe(&entry.path()).report());
+                    }
+                }
+                if !any {
+                    println!("\nexisting camera directories: none yet");
+                }
+            }
+            return Ok(());
+        }
+
         // Reports the structure of PM_PASSWORD_HASH as this process sees it.
         Some("check-hash") => {
             let raw = std::env::var("PM_PASSWORD_HASH").unwrap_or_default();
@@ -167,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
     db::purge_expired_sessions(&pool).await;
     // A run recorded as in-progress cannot be one: this process just started.
     db::reconcile_interrupted_runs(&pool).await;
+    archive::run::sweep_orphaned_partials(&pool, &config.archive_dir).await;
 
     // A missing Docker socket is reported through /api/health rather than being
     // fatal: an app that explains what's wrong beats a crash loop.
@@ -240,7 +292,9 @@ async fn main() -> anyhow::Result<()> {
         // link or a refresh lands on the app rather than a 404.
         .fallback_service(ServeDir::new(&static_dir).fallback(index))
         .layer(axum::middleware::from_fn(trace::middleware))
-        .with_state(state);
+        .with_state(state.clone());
+
+    let state_for_shutdown = state;
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!("listening on http://{}", config.bind);
@@ -252,6 +306,16 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // The HTTP server has stopped, but an archive job is a background task and
+    // would simply die with the process. Give it a moment to reach its next
+    // day boundary and record a checkpoint, so a redeploy costs one day of
+    // packing rather than the whole month. Bounded, because Docker's own grace
+    // period is finite and being killed here is no worse than not waiting.
+    let waited = jobs_quiet_for(&state_for_shutdown, std::time::Duration::from_secs(20)).await;
+    if !waited {
+        tracing::warn!("a job was still running at shutdown; it will resume from its last checkpoint");
+    }
     Ok(())
 }
 
@@ -438,8 +502,54 @@ async fn watchdog_loop(state: AppState) {
     }
 }
 
+/// Wait for the job lock to come free, up to `limit`.
+///
+/// True if the jobs went quiet in time. Polled rather than signalled: a job
+/// holds the lock for its whole run, and all we need to know is whether it let
+/// go — which is exactly what `try_lock` answers.
+async fn jobs_quiet_for(state: &AppState, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if state.jobs.lock.try_lock().is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Stop serving on SIGINT *or* SIGTERM.
+///
+/// SIGTERM is the one that matters: it is what `docker stop` and
+/// `docker compose up -d` send, and Rust's default disposition for it is to
+/// terminate the process outright. Listening only for ctrl-c meant graceful
+/// shutdown never ran in a container at all — every redeploy killed an
+/// in-progress archive mid-write, which is most of why runs were interrupted.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Nothing to wait for, but never resolve — otherwise this arm wins
+            // the select immediately and shuts the server down at startup.
+            Err(e) => {
+                tracing::warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
     tracing::info!("shutting down");
 }
 
@@ -622,6 +732,7 @@ async fn health_handler(
 
     Ok(Json(Health {
         ok: docker_check.ok && container_check.ok && backup.ok && archive.ok,
+        version: env!("CARGO_PKG_VERSION").to_string(),
         docker: docker_check,
         container: container_check,
         backup_dir: backup,

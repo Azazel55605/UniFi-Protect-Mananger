@@ -4,6 +4,7 @@
 //! Nothing removes a source file until the archive holding it has been read
 //! back and compared byte for byte.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::{broadcast, Mutex};
 
 use super::{pack, plan};
+use crate::db;
 
 /// How recently a month must have been written to for archiving to hold off.
 ///
@@ -419,14 +421,9 @@ fn preflight_writable(archive_dir: &Path, targets: &[CameraMonth]) -> anyhow::Re
         let dir = archive_dir.join(&target.camera);
         let probe = if dir.is_dir() { dir } else { archive_dir.to_path_buf() };
 
-        if let Err(e) = crate::health::probe_writable(&probe) {
-            let ids = std::fs::metadata(&probe)
-                .map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    format!("owned by {}:{}", m.uid(), m.gid())
-                })
-                .unwrap_or_else(|_| "owner unknown".into());
-            anyhow::bail!("{}", crate::health::unwritable(&probe, &e, &ids));
+        let report = crate::health::describe(&probe);
+        if !report.writable() {
+            anyhow::bail!("{}", report.summary());
         }
     }
     Ok(())
@@ -629,65 +626,147 @@ async fn archive_months(
             continue;
         }
 
-        // Packing and verifying are long, blocking, I/O-heavy jobs; they must
-        // not sit on the async runtime's worker threads.
-        let progress = ctx.jobs.progress.clone();
-        let month_for_task = month.clone();
-        let dest_for_task = dest.clone();
+        // Packed a day at a time, with a checkpoint after each. A camera-month
+        // here runs to tens or hundreds of gigabytes and takes as long as the
+        // system's load allows; being killed part-way through used to throw
+        // all of it away. The day is the unit of work worth not repeating.
+        let partial = pack::partial_path(&dest);
+        let (mut offset, mut hashes, resumed_after) =
+            resume_point(&ctx.pool, &partial, &month).await;
+
+        if offset > 0 {
+            tracing::info!(
+                "{}/{} resuming after {} — {} file(s) already packed",
+                month.camera,
+                month.month,
+                resumed_after.as_deref().unwrap_or("an earlier day"),
+                hashes.len()
+            );
+        }
+
         let base = overall_done;
+        let mut day_error = None;
 
-        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let dest_label = dest_for_task.display().to_string();
-            let packed = pack::pack(&month_for_task, &dest_for_task, |p| {
-                let _ = progress.send(RunProgress {
-                    run_id,
-                    kind: RunKind::Archive,
-                    camera: Some(month_for_task.camera.clone()),
-                    month: Some(month_for_task.month.clone()),
-                    phase: "packing".into(),
-                    current_file: Some(p.name.to_string()),
-                    files_done: p.index as i64 + 1,
-                    files_total: p.total as i64,
-                    overall_done: base + p.index as i64 + 1,
-                    overall_total,
-                    finished: false,
-                    status: None,
-                    message: None,
-                });
+        for (day, files) in days_to_pack(&month, &hashes) {
+            let progress = ctx.jobs.progress.clone();
+            let partial_for_task = partial.clone();
+            let camera = month.camera.clone();
+            let month_name = month.month.clone();
+            let already = hashes.len() as i64;
+            let label = format!("{}/{} {day}", month.camera, month.month);
+
+            let packed = tokio::task::spawn_blocking(move || {
+                pack::append_day(&partial_for_task, offset, &files, |p| {
+                    let _ = progress.send(RunProgress {
+                        run_id,
+                        kind: RunKind::Archive,
+                        camera: Some(camera.clone()),
+                        month: Some(month_name.clone()),
+                        phase: "packing".into(),
+                        current_file: Some(p.name.to_string()),
+                        files_done: already + p.index as i64 + 1,
+                        files_total: 0,
+                        overall_done: base + already + p.index as i64 + 1,
+                        overall_total,
+                        finished: false,
+                        status: None,
+                        message: None,
+                    });
+                })
+                .map_err(|e| e.context(format!("writing {label}")))
             })
-            .map_err(|e| e.context(format!("writing {dest_label}")))?;
+            .await?;
 
-            let verified = pack::verify(&dest_for_task, &packed.hashes, |p| {
+            let packed = match packed {
+                Ok(p) => p,
+                // Stop this month here rather than skipping the day: the days
+                // already checkpointed stay on disk and resume next time.
+                Err(e) => {
+                    day_error = Some(e);
+                    break;
+                }
+            };
+
+            offset = packed.end_offset;
+            hashes.extend(packed.hashes.clone());
+
+            // Recorded only once the bytes are flushed and synced. Late is one
+            // repeated day; early would claim a day is stored that is not.
+            if let Err(e) = db::save_checkpoint(
+                &ctx.pool,
+                &month.camera,
+                &month.month,
+                &day,
+                packed.end_offset,
+                &packed.hashes,
+            )
+            .await
+            {
+                tracing::warn!("could not checkpoint {}/{} {day}: {e}", month.camera, month.month);
+            }
+        }
+
+        if let Some(e) = day_error {
+            failed.push(format!("{}/{}: {:#}", month.camera, month.month, e));
+            tracing::error!(
+                "{}/{} stopped mid-archive: {:#} — {} day(s) checkpointed and kept",
+                month.camera,
+                month.month,
+                e,
+                hashes.len()
+            );
+            overall_done += month.files.len() as i64;
+            continue;
+        }
+
+        let written = match pack::finish(&partial, &dest) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                failed.push(format!("{}/{}: {:#}", month.camera, month.month, e));
+                overall_done += month.files.len() as i64;
+                continue;
+            }
+        };
+
+        let progress = ctx.jobs.progress.clone();
+        let dest_for_task = dest.clone();
+        let hashes_for_task = hashes.clone();
+        let camera = month.camera.clone();
+        let month_name = month.month.clone();
+        let total_files = hashes.len() as i64;
+
+        let verified = tokio::task::spawn_blocking(move || {
+            pack::verify(&dest_for_task, &hashes_for_task, |p| {
                 let _ = progress.send(RunProgress {
                     run_id,
                     kind: RunKind::Archive,
-                    camera: Some(month_for_task.camera.clone()),
-                    month: Some(month_for_task.month.clone()),
+                    camera: Some(camera.clone()),
+                    month: Some(month_name.clone()),
                     phase: "verifying".into(),
                     current_file: Some(p.name.to_string()),
                     files_done: p.index as i64 + 1,
                     files_total: p.total as i64,
-                    overall_done: base + p.total as i64,
+                    overall_done: base + total_files,
                     overall_total,
                     finished: false,
                     status: None,
                     message: None,
                 });
             })
-            .map_err(|e| e.context(format!("verifying {dest_label}")))?;
-
-            Ok((packed.bytes_written, packed.hashes.len(), verified))
         })
         .await??;
 
-        let (written, count, verified) = outcome;
+        let count = hashes.len();
         overall_done += month.files.len() as i64;
         bytes += written as i64;
 
         if !verified.ok() {
             // The archive is not a faithful copy, so the originals stay put
             // and the bad tar is removed rather than left to look finished.
+            // The checkpoints go too: they describe an archive that has just
+            // been judged untrustworthy, so the next attempt starts clean.
             let _ = std::fs::remove_file(&dest);
+            db::clear_checkpoints(&ctx.pool, &month.camera, &month.month).await;
             failed.extend(verified.failed_files());
             tracing::error!(
                 "verification failed for {}/{}: {} — sources left in place",
@@ -697,6 +776,10 @@ async fn archive_months(
             );
             continue;
         }
+
+        // The archive is finished and proven, so the notes taken while
+        // building it have nothing left to say.
+        db::clear_checkpoints(&ctx.pool, &month.camera, &month.month).await;
 
         record_archive(&ctx.pool, &month, &dest, written as i64, count as i64).await;
 
@@ -739,6 +822,138 @@ async fn archive_months(
     }
 
     Ok(ArchiveOutcome { done: overall_done, bytes, failed, message })
+}
+
+/// Remove partial archives that nothing can resume, once at startup.
+///
+/// A `.tar.partial` with checkpoints behind it is work in progress and is kept
+/// — that is the whole point of the checkpoints. One with nothing describing
+/// it is the opposite: a camera-month of bytes, invisible in the UI because it
+/// does not end in `.tar`, that no run will ever pick up. Left alone they
+/// accumulate one per interrupted attempt.
+pub async fn sweep_orphaned_partials(pool: &SqlitePool, archive_dir: &Path) {
+    let known = db::checkpointed_months(pool).await;
+    let Ok(cameras) = std::fs::read_dir(archive_dir) else { return };
+
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+
+    for cam in cameras.filter_map(Result::ok) {
+        if !cam.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let camera = cam.file_name().to_string_lossy().to_string();
+        let Ok(files) = std::fs::read_dir(cam.path()) else { continue };
+
+        for f in files.filter_map(Result::ok) {
+            let name = f.file_name().to_string_lossy().to_string();
+            let Some(month) = name.strip_suffix(".tar.partial") else { continue };
+            if known.iter().any(|(c, m)| c == &camera && m == month) {
+                continue;
+            }
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(f.path()) {
+                Ok(()) => {
+                    removed += 1;
+                    freed += size;
+                    tracing::info!("removed abandoned partial archive {camera}/{month}");
+                }
+                Err(e) => tracing::warn!("could not remove {}: {e}", f.path().display()),
+            }
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!("reclaimed {freed} bytes from {removed} abandoned partial archive(s)");
+    }
+
+    // The mirror image: checkpoints describing a partial that is gone. They
+    // would send the next run to an offset in a file that no longer exists.
+    for (camera, month) in known {
+        let partial = pack::partial_path(&plan::archive_path(archive_dir, &camera, &month));
+        if !partial.is_file() {
+            tracing::info!("dropping checkpoints for {camera}/{month}: no partial archive left");
+            db::clear_checkpoints(pool, &camera, &month).await;
+        }
+    }
+}
+
+/// Where to resume a partial archive, and what is already in it.
+///
+/// Every reason to distrust the checkpoints ends the same way — start over
+/// from zero — because the alternative is appending to an archive whose
+/// contents we cannot describe, and then deleting the originals on the
+/// strength of that description.
+async fn resume_point(
+    pool: &SqlitePool,
+    partial: &Path,
+    month: &plan::MonthContents,
+) -> (u64, BTreeMap<String, String>, Option<String>) {
+    let fresh = (0u64, BTreeMap::new(), None);
+    let saved = db::load_checkpoints(pool, &month.camera, &month.month).await;
+    if saved.is_empty() {
+        // Any partial left over is from a run that got nowhere, or from a
+        // build before checkpoints existed. Nothing describes it, so it is
+        // rubble rather than progress.
+        let _ = std::fs::remove_file(partial);
+        return fresh;
+    }
+
+    let Some(last) = saved.last() else { return fresh };
+    let on_disk = match std::fs::metadata(partial) {
+        Ok(m) => m.len(),
+        Err(_) => {
+            // Checkpoints describing an archive that is not there.
+            db::clear_checkpoints(pool, &month.camera, &month.month).await;
+            return fresh;
+        }
+    };
+
+    // Shorter than the checkpoint means the file is not the one the
+    // checkpoints were taken against — truncated, replaced, or a write that
+    // never reached the disk.
+    if on_disk < last.end_offset {
+        tracing::warn!(
+            "{}/{} partial is {on_disk} bytes but checkpointed at {} — repacking from the start",
+            month.camera,
+            month.month,
+            last.end_offset
+        );
+        let _ = std::fs::remove_file(partial);
+        db::clear_checkpoints(pool, &month.camera, &month.month).await;
+        return fresh;
+    }
+
+    let mut hashes = BTreeMap::new();
+    for c in &saved {
+        hashes.extend(c.hashes.clone());
+    }
+    (last.end_offset, hashes, Some(last.day.clone()))
+}
+
+/// The month's files grouped by day, skipping what is already archived.
+///
+/// Keyed on the entries already hashed rather than on which days have a
+/// checkpoint, so a file that appeared in an already-packed day — a backfill
+/// landing late — is still picked up instead of being deleted unarchived when
+/// the day directory is removed.
+fn days_to_pack(
+    month: &plan::MonthContents,
+    have: &BTreeMap<String, String>,
+) -> Vec<(String, Vec<(PathBuf, String)>)> {
+    let mut days: BTreeMap<String, Vec<(PathBuf, String)>> = BTreeMap::new();
+
+    for (path, entry) in &month.files {
+        if have.contains_key(entry) {
+            continue;
+        }
+        // Entry names are `<day>/<file>`, which is what makes the day the
+        // natural checkpoint boundary.
+        let day = entry.split('/').next().unwrap_or("").to_string();
+        days.entry(day).or_default().push((path.clone(), entry.clone()));
+    }
+
+    days.into_iter().collect()
 }
 
 /// Counters for one progress update, grouped because nine positional
@@ -1344,7 +1559,9 @@ mod tests {
         // point of checking here rather than failing inside `pack`.
         let message = err.to_string();
         assert!(message.contains("not writable"), "{message}");
-        assert!(message.contains("group_add"), "{message}");
+        // We own the temp directory, so the owner bit is the one being
+        // consulted and the one to name.
+        assert!(message.contains("chmod u+w"), "{message}");
 
         // Nothing was recorded: a refusal is not a failed run.
         let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM archive_runs")
@@ -1404,6 +1621,166 @@ mod tests {
         assert!(rendered.contains("permission denied"), "the cause survives: {rendered}");
         // And the plain Display really does drop it, which is why `chain` exists.
         assert!(!err.to_string().contains("permission denied"));
+    }
+
+    /// The point of the whole checkpoint mechanism: a month that was half
+    /// packed before the process died is finished, not restarted.
+    ///
+    /// Proven by deleting the first day's sources after checkpointing it. If
+    /// the run resumed, those files are already inside the partial and reach
+    /// the finished archive; if it repacked from scratch they are gone for
+    /// good and the archive is short.
+    #[tokio::test]
+    async fn an_interrupted_month_resumes_instead_of_repacking() {
+        let e = env("resume").await;
+        let backup = e.root.join("backup");
+        let month = plan::months_for_camera(&backup, "Front Door")
+            .into_iter()
+            .find(|m| m.month == plan::cutoff_month(now(), 3))
+            .expect("the old month exists");
+
+        let dest = plan::archive_path(&e.root.join("archive"), &month.camera, &month.month);
+        let partial = pack::partial_path(&dest);
+
+        // Pack the first day only, exactly as an interrupted run would have.
+        let day = format!("{}-01", month.month);
+        let first: Vec<_> = month
+            .files
+            .iter()
+            .filter(|(_, entry)| entry.starts_with(&day))
+            .cloned()
+            .collect();
+        assert_eq!(first.len(), 3);
+
+        let packed = pack::append_day(&partial, 0, &first, |_| {}).unwrap();
+        db::save_checkpoint(
+            &e.pool,
+            &month.camera,
+            &month.month,
+            &day,
+            packed.end_offset,
+            &packed.hashes,
+        )
+        .await
+        .unwrap();
+
+        // Now the sources for that day vanish. Only a resume can still produce
+        // a complete archive.
+        for (path, _) in &first {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let jobs = Jobs::default();
+        let rx = jobs.progress.subscribe();
+        run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false)
+            .await
+            .unwrap();
+        let done = wait_for_finish(&jobs, rx).await;
+        assert_eq!(done.status, Some(RunStatus::Succeeded), "{:?}", done.message);
+
+        let entries = pack::list(&dest).unwrap();
+        assert_eq!(entries.len(), 6, "both days are in the finished archive");
+        assert!(
+            entries.iter().any(|(name, _)| name.starts_with(&day)),
+            "the checkpointed day survived: {entries:?}"
+        );
+        assert!(!partial.exists(), "the partial is promoted, not left behind");
+        assert!(
+            db::load_checkpoints(&e.pool, &month.camera, &month.month).await.is_empty(),
+            "a finished archive leaves no checkpoints"
+        );
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoints_that_do_not_match_the_partial_start_over() {
+        let e = env("resume-bad").await;
+        let month = plan::months_for_camera(&e.root.join("backup"), "Front Door")
+            .into_iter()
+            .find(|m| m.month == plan::cutoff_month(now(), 3))
+            .unwrap();
+        let dest = plan::archive_path(&e.root.join("archive"), &month.camera, &month.month);
+        let partial = pack::partial_path(&dest);
+
+        // A checkpoint claiming far more than the file holds — the shape a
+        // torn or replaced partial leaves behind.
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, b"not much").unwrap();
+        db::save_checkpoint(
+            &e.pool,
+            &month.camera,
+            &month.month,
+            &format!("{}-01", month.month),
+            999_999,
+            &BTreeMap::from([("x".to_string(), "y".to_string())]),
+        )
+        .await
+        .unwrap();
+
+        let (offset, hashes, from) = resume_point(&e.pool, &partial, &month).await;
+        assert_eq!(offset, 0, "an offset past the end of the file is not resumed from");
+        assert!(hashes.is_empty(), "and nothing is claimed to be archived");
+        assert!(from.is_none());
+        assert!(!partial.exists(), "the untrustworthy partial is removed");
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_sweep_keeps_resumable_partials_and_removes_abandoned_ones() {
+        let e = env("sweep").await;
+        let archive = e.root.join("archive");
+        std::fs::create_dir_all(archive.join("Front Door")).unwrap();
+
+        let resumable = archive.join("Front Door/2026-01.tar.partial");
+        let abandoned = archive.join("Front Door/2025-11.tar.partial");
+        std::fs::write(&resumable, b"in progress").unwrap();
+        std::fs::write(&abandoned, b"nothing describes me").unwrap();
+        db::save_checkpoint(&e.pool, "Front Door", "2026-01", "2026-01-01", 11, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        sweep_orphaned_partials(&e.pool, &archive).await;
+
+        assert!(resumable.exists(), "a partial with checkpoints is work in progress");
+        assert!(!abandoned.exists(), "one with nothing behind it is rubble");
+
+        // And checkpoints whose partial has gone are dropped, so no run is
+        // sent to an offset in a file that does not exist.
+        std::fs::remove_file(&resumable).unwrap();
+        sweep_orphaned_partials(&e.pool, &archive).await;
+        assert!(db::load_checkpoints(&e.pool, "Front Door", "2026-01").await.is_empty());
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[test]
+    fn a_file_backfilled_into_an_already_packed_day_is_still_picked_up() {
+        // The hazard resume introduces: a day is checkpointed, then the backup
+        // service writes one more clip into it. Keying on packed *entries*
+        // rather than packed days means the straggler is archived instead of
+        // being deleted with the day directory.
+        let month = plan::MonthContents {
+            camera: "Front Door".into(),
+            month: "2026-06".into(),
+            day_dirs: Vec::new(),
+            files: vec![
+                (PathBuf::from("/b/2026-06-01/a.mp4"), "2026-06-01/a.mp4".into()),
+                (PathBuf::from("/b/2026-06-01/late.mp4"), "2026-06-01/late.mp4".into()),
+                (PathBuf::from("/b/2026-06-02/c.mp4"), "2026-06-02/c.mp4".into()),
+            ],
+            bytes: 0,
+            newest_write: None,
+        };
+        let have = BTreeMap::from([("2026-06-01/a.mp4".to_string(), "hash".to_string())]);
+
+        let days = days_to_pack(&month, &have);
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[0].0, "2026-06-01");
+        assert_eq!(days[0].1.len(), 1, "only the file that is not already packed");
+        assert_eq!(days[0].1[0].1, "2026-06-01/late.mp4");
+        assert_eq!(days[1].1.len(), 1);
     }
 
     #[tokio::test]
