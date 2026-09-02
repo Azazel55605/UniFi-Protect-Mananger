@@ -46,7 +46,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::auth::authenticated;
 use crate::config::Config;
 use crate::error::ApiError;
-use crate::health::check_backup_dir;
+use crate::health::{check_archive_dir, check_backup_dir};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -618,12 +618,14 @@ async fn health_handler(
     };
 
     let backup = check_backup_dir(&state.config.backup_dir);
+    let archive = check_archive_dir(&state.config.archive_dir);
 
     Ok(Json(Health {
-        ok: docker_check.ok && container_check.ok && backup.ok,
+        ok: docker_check.ok && container_check.ok && backup.ok && archive.ok,
         docker: docker_check,
         container: container_check,
         backup_dir: backup,
+        archive_dir: archive,
         warnings,
         info,
     }))

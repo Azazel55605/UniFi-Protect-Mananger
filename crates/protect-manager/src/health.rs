@@ -1,10 +1,10 @@
 //! Health: can this container actually see everything it needs?
 //!
-//! These checks answer three questions about the real deployment — can we
-//! reach the Docker socket, can we find the backup container without knowing
-//! its name, and can we read the clip directory. A permission problem is
-//! obvious here; the same problem discovered during an archive run shows up as
-//! a failure halfway through.
+//! These checks answer four questions about the real deployment — can we reach
+//! the Docker socket, can we find the backup container without knowing its
+//! name, can we read the clip directory, and can we write to the archive
+//! directory. A permission problem is obvious here; the same problem
+//! discovered during an archive run shows up as a failure halfway through.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -63,6 +63,66 @@ pub fn check_backup_dir(dir: &Path) -> Check {
     }
 }
 
+/// Verify we can actually write into the archive root.
+///
+/// Checked by writing, not by reading the mode bits. The image runs as an
+/// unprivileged uid with the clip gid added through `group_add`, so the
+/// permissions that matter come from supplementary groups — and mode bits plus
+/// an owner id cannot tell you whether *this* process is in the group, let
+/// alone what an ACL or a read-only bind mount will do. The only honest test
+/// is the one archiving itself performs.
+pub fn check_archive_dir(dir: &Path) -> Check {
+    let meta = match std::fs::metadata(dir) {
+        Ok(m) => m,
+        // Not an error to be smoothed over by creating it: the directory comes
+        // from a bind mount, and if it is missing the mount is wrong. Creating
+        // it here would put archives inside the container, where they are lost
+        // on the next `docker compose up`.
+        Err(e) => {
+            return fail(format!(
+                "{}: {e} — archiving cannot run. Check the volume is mounted.",
+                dir.display()
+            ))
+        }
+    };
+    if !meta.is_dir() {
+        return fail(format!("{} is not a directory", dir.display()));
+    }
+
+    let ids = format!(
+        "owned by {}:{}, we run as {}:{}",
+        meta.uid(),
+        meta.gid(),
+        unsafe { libc_geteuid() },
+        unsafe { libc_getegid() },
+    );
+
+    // A fixed name, removed straight away. A pid-suffixed one would leave
+    // litter behind if the process were killed between create and remove, and
+    // health runs often enough for that to accumulate.
+    let probe = dir.join(".protect-manager-write-test");
+    let _ = std::fs::remove_file(&probe);
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            ok(format!("{} writable ({ids})", dir.display()))
+        }
+        Err(e) => fail(format!(
+            "{} is not writable: {e} — archiving will fail. Add the group owning it to \
+             `group_add`, or chown it to {}:{}. ({ids})",
+            dir.display(),
+            unsafe { libc_geteuid() },
+            unsafe { libc_getegid() },
+        )),
+    }
+}
+
+/// The effective uid, for tests that must skip when running as root.
+#[cfg(test)]
+pub unsafe fn geteuid_for_tests() -> u32 {
+    unsafe { libc_geteuid() }
+}
+
 // Avoiding a dependency on `libc` for two calls.
 unsafe fn libc_geteuid() -> u32 {
     extern "C" {
@@ -76,4 +136,43 @@ unsafe fn libc_getegid() -> u32 {
         fn getegid() -> u32;
     }
     getegid()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unwritable_archive_directory_is_caught_before_a_run_is_started() {
+        let root = std::env::temp_dir().join(format!("pm-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(check_archive_dir(&root).ok, "a normal directory is writable");
+        // The probe must not survive the check that wrote it.
+        assert!(!root.join(".protect-manager-write-test").exists());
+
+        // A missing mount reads as a failure, and is never created for you.
+        let missing = root.join("not-mounted");
+        let check = check_archive_dir(&missing);
+        assert!(!check.ok);
+        assert!(!missing.exists(), "a missing archive root must not be created");
+
+        // Root runs as uid 0 and can write through any mode, so the read-only
+        // case is only meaningful unprivileged.
+        if unsafe { libc_geteuid() } != 0 {
+            let locked = root.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+            std::fs::set_permissions(&locked, perms).unwrap();
+
+            let check = check_archive_dir(&locked);
+            assert!(!check.ok, "{}", check.detail);
+            assert!(check.detail.contains("not writable"), "{}", check.detail);
+            assert!(check.detail.contains("group_add"), "the fix, not just the fault");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -243,6 +243,7 @@ function StatusStrip() {
     { label: "docker", ok: data.docker.ok },
     { label: "backup", ok: data.container.ok },
     { label: "clips", ok: data.backup_dir.ok },
+    { label: "archive", ok: data.archive_dir.ok },
   ];
 
   return (

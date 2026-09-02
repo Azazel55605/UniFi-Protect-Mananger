@@ -223,6 +223,12 @@ device: number, };
 
 export type Health = { ok: boolean, docker: Check, container: Check, backup_dir: Check, 
 /**
+ * Whether archives can actually be written. Separate from `backup_dir`
+ * because they fail for opposite reasons: the clip directory needs to be
+ * readable and is written by someone else, this one we write ourselves.
+ */
+archive_dir: Check, 
+/**
  * Things that are wrong and need attention.
  */
 warnings: Array<string>, 

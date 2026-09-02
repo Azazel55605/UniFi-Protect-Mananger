@@ -19,7 +19,12 @@ services:
       # written and verified. Mount it `:ro` if you would rather it could not.
       - ${BACKUP_DIR:?path to your unifi-protect-backup output root}:/backup
 
-      # Where .tar archives are written. Not used until Phase 3.
+      # Where .tar archives are written. This one the app writes to itself, so
+      # it must be writable by the container's uid (10001) or by a group listed
+      # in `group_add` below — otherwise every archive run fails with
+      # "Permission denied". /api/health checks this by actually writing, and
+      # says which ids it saw, so a mismatch shows up on the dashboard rather
+      # than halfway through a run.
       - ${ARCHIVE_DIR:?path to your archive directory}:/archive
 
       - pm-state:/var/lib/protect-manager   # our database, sessions, caches
@@ -36,7 +41,10 @@ services:
 
     # The gid that owns the clip files: `stat -c %g <a-clip-file>`. Without it
     # the app cannot read the clip directory, and /api/health will say so.
-    # Depending on your host you may also need the docker socket's group.
+    # Depending on your host you may also need the docker socket's group, and
+    # the group owning the archive directory if it differs from the clip files'
+    # — the simpler alternative for that one is
+    # `chown 10001 "$ARCHIVE_DIR"` on the host.
     group_add:
       - ${CLIP_GID:?gid owning the clip files}
 

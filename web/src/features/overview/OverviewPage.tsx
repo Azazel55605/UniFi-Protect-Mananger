@@ -42,6 +42,7 @@ export function OverviewPage() {
     ["Docker socket", h?.docker],
     ["Backup container", h?.container],
     ["Clip directory", h?.backup_dir],
+    ["Archive directory", h?.archive_dir],
   ];
 
   return (

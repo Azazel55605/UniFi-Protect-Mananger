@@ -19,8 +19,10 @@ storage on a schedule, and see whether the pipeline is actually working.
 - Camera directories identified by evidence (dated folders holding clips),
   not by excluding a hardcoded list of known non-camera names
 - Health checks: Docker socket, container state, clip-directory readability,
-  and a warning if the backup service's retention is shorter than your
-  archiving threshold — which would delete footage before it is ever archived
+  archive-directory writability (tested by writing, since mode bits cannot tell
+  you whether this process is in the right supplementary group), and a warning
+  if the backup service's retention is shorter than your archiving threshold —
+  which would delete footage before it is ever archived
 - Live container logs streamed over an authenticated WebSocket
 - An event index rebuilt on a timer from the backup service's own database,
   with camera names and detection types recovered from clip paths — neither is

@@ -422,6 +422,19 @@ pub async fn run_archive(
         anyhow::bail!("nothing to archive");
     }
 
+    // Check we can write before claiming a run. A permission problem found
+    // here is a sentence naming the directory and the fix; the same problem
+    // found inside `pack` is a bare "Permission denied (os error 13)" attached
+    // to a failed run, halfway down the history. A dry run writes nothing, so
+    // it is deliberately allowed through — being able to preview without a
+    // writable archive mount is useful while you are still fixing the mount.
+    if !dry_run {
+        let check = crate::health::check_archive_dir(&ctx.archive_dir);
+        if !check.ok {
+            anyhow::bail!("{}", check.detail);
+        }
+    }
+
     let months: Vec<plan::MonthContents> = selected
         .iter()
         .filter_map(|t| {
@@ -547,6 +560,7 @@ async fn archive_months(
         let base = overall_done;
 
         let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let dest_label = dest_for_task.display().to_string();
             let packed = pack::pack(&month_for_task, &dest_for_task, |p| {
                 let _ = progress.send(RunProgress {
                     run_id,
@@ -563,7 +577,8 @@ async fn archive_months(
                     status: None,
                     message: None,
                 });
-            })?;
+            })
+            .map_err(|e| e.context(format!("writing {dest_label}")))?;
 
             let verified = pack::verify(&dest_for_task, &packed.hashes, |p| {
                 let _ = progress.send(RunProgress {
@@ -581,7 +596,8 @@ async fn archive_months(
                     status: None,
                     message: None,
                 });
-            })?;
+            })
+            .map_err(|e| e.context(format!("verifying {dest_label}")))?;
 
             Ok((packed.bytes_written, packed.hashes.len(), verified))
         })
@@ -946,6 +962,11 @@ mod tests {
             }
         }
 
+        // The archive root exists but is empty, which is what a deployment
+        // looks like: it is a bind mount, so it is always there before the
+        // first run.
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+
         let pool = crate::db::connect(&root.join("state")).await.unwrap();
         let settings = Settings {
             camera_dirs: vec!["Front Door".into()],
@@ -955,6 +976,10 @@ mod tests {
             ..Default::default()
         };
         Env { root, pool, settings }
+    }
+
+    fn is_empty(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir).map(|mut e| e.next().is_none()).unwrap_or(false)
     }
 
     /// Set a file's modification time to `age` seconds ago.
@@ -1049,7 +1074,7 @@ mod tests {
 
         assert_eq!(done.status, Some(RunStatus::Succeeded));
         assert!(done.message.unwrap().contains("dry run"));
-        assert!(!e.root.join("archive").exists(), "a dry run must not write an archive");
+        assert!(is_empty(&e.root.join("archive")), "a dry run must not write an archive");
         let old = plan::cutoff_month(now(), 3);
         assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
 
@@ -1198,7 +1223,7 @@ mod tests {
         assert_eq!(done.status, Some(RunStatus::Succeeded));
         let message = done.message.unwrap();
         assert!(message.contains("previewed the oldest month"), "{message}");
-        assert!(!e.root.join("archive").exists());
+        assert!(is_empty(&e.root.join("archive")));
         let old = plan::cutoff_month(now(), 3);
         assert!(e.root.join("backup/Front Door").join(format!("{old}-01")).exists());
 
@@ -1217,6 +1242,43 @@ mod tests {
         let result = run_archive(ctx(&e, &jobs), settings, Vec::new(), false, false).await;
         assert!(result.is_err(), "a real run must refuse rather than pick a month itself");
 
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_run_refuses_up_front_when_the_archive_directory_cannot_be_written() {
+        // Root writes through any mode, so there is nothing to test as root.
+        if unsafe { crate::health::geteuid_for_tests() } == 0 {
+            return;
+        }
+
+        let e = env("readonly").await;
+        let archive = e.root.join("archive");
+        let mut perms = std::fs::metadata(&archive).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&archive, perms).unwrap();
+
+        let jobs = Jobs::default();
+        let err = run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false)
+            .await
+            .expect_err("must refuse rather than start a run it cannot finish");
+
+        // The message has to name the fix, not just the errno — the whole
+        // point of checking here rather than failing inside `pack`.
+        let message = err.to_string();
+        assert!(message.contains("not writable"), "{message}");
+        assert!(message.contains("group_add"), "{message}");
+
+        // Nothing was recorded: a refusal is not a failed run.
+        let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM archive_runs")
+            .fetch_one(&e.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "a refusal must not leave a run in the history");
+
+        let mut perms = std::fs::metadata(&archive).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&archive, perms).unwrap();
         std::fs::remove_dir_all(&e.root).unwrap();
     }
 

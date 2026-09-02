@@ -131,6 +131,10 @@ pub struct Health {
     pub docker: Check,
     pub container: Check,
     pub backup_dir: Check,
+    /// Whether archives can actually be written. Separate from `backup_dir`
+    /// because they fail for opposite reasons: the clip directory needs to be
+    /// readable and is written by someone else, this one we write ourselves.
+    pub archive_dir: Check,
     /// Things that are wrong and need attention.
     pub warnings: Vec<String>,
     /// Things worth stating that are not, by themselves, problems. Kept
