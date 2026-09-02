@@ -69,6 +69,18 @@ fn announce(jobs: &Jobs, run_id: i64, kind: RunKind, target: Option<&CameraMonth
     });
 }
 
+/// An error rendered with everything under it.
+///
+/// `anyhow`'s `Display` prints only the outermost context, so a
+/// `.context("writing /archive/...")` wrapped around an io error renders as
+/// just the path — the errno that says *why* is still in the chain, but
+/// nothing shows it. That is how a permission failure reached the run history
+/// as a bare filename and read as "failed with no error". `{:#}` walks the
+/// chain, so the cause always travels with the context.
+fn chain(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
 fn kind_str(k: RunKind) -> &'static str {
     match k {
         RunKind::Archive => "archive",
@@ -127,6 +139,16 @@ async fn start_run(
     .execute(pool)
     .await?
     .last_insert_rowid();
+
+    let what = target
+        .map(|t| format!("{}/{}", t.camera, t.month))
+        .unwrap_or_else(|| "everything due".into());
+    tracing::info!(
+        "run {id} started: {} {what}{}{} ({files_total} files)",
+        kind_str(kind),
+        if dry_run { ", dry run" } else { "" },
+        if scheduled { ", scheduled" } else { "" },
+    );
     Ok(id)
 }
 
@@ -147,13 +169,32 @@ async fn finish_run(
     )
     .bind(status_str(status))
     .bind(now())
-    .bind(message)
+    .bind(message.clone())
     .bind(files_done)
     .bind(bytes)
     .bind(failed.join("\n"))
     .bind(id)
     .execute(pool)
     .await;
+
+    // Also to the log, always. The run history is the right place to *notice*
+    // a failure, but it is one line in a table and it is gone if the database
+    // is not the thing you have to hand. `docker logs` is where anyone debugs
+    // a container, so the outcome has to be there too.
+    let detail = message.as_deref().unwrap_or("no message");
+    match status {
+        RunStatus::Succeeded => {
+            tracing::info!("run {id} succeeded: {detail} ({files_done} files, {bytes} bytes)")
+        }
+        RunStatus::Failed => {
+            tracing::error!("run {id} failed: {detail}");
+            for f in failed {
+                tracing::error!("run {id}: {f}");
+            }
+        }
+        RunStatus::Interrupted => tracing::warn!("run {id} interrupted: {detail}"),
+        RunStatus::Running => {}
+    }
 }
 
 pub async fn recent_runs(pool: &SqlitePool, limit: i64) -> anyhow::Result<Vec<ArchiveRun>> {
@@ -352,6 +393,45 @@ pub async fn due_months(
     Ok(due)
 }
 
+/// Refuse before claiming a run if anything it would write to refuses us.
+///
+/// Deliberately scoped to the cameras being archived rather than reusing the
+/// dashboard's whole-tree check: one camera directory with the wrong owner
+/// should not block archiving every other camera. The dashboard wants the
+/// broad view, a run wants the narrow one.
+fn preflight_writable(archive_dir: &Path, targets: &[CameraMonth]) -> anyhow::Result<()> {
+    if let Err(e) = std::fs::metadata(archive_dir) {
+        anyhow::bail!(
+            "{}: {e} — archiving cannot run. Check the volume is mounted.",
+            archive_dir.display()
+        );
+    }
+    let mut checked: Vec<&str> = Vec::new();
+
+    for target in targets {
+        if checked.contains(&target.camera.as_str()) {
+            continue;
+        }
+        checked.push(&target.camera);
+
+        // The camera's own directory when it already exists, the root when it
+        // does not — creating it is the write that would fail then.
+        let dir = archive_dir.join(&target.camera);
+        let probe = if dir.is_dir() { dir } else { archive_dir.to_path_buf() };
+
+        if let Err(e) = crate::health::probe_writable(&probe) {
+            let ids = std::fs::metadata(&probe)
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    format!("owned by {}:{}", m.uid(), m.gid())
+                })
+                .unwrap_or_else(|_| "owner unknown".into());
+            anyhow::bail!("{}", crate::health::unwritable(&probe, &e, &ids));
+        }
+    }
+    Ok(())
+}
+
 fn plural_days(n: u32) -> String {
     if n == 1 { "1 day".into() } else { format!("{n} days") }
 }
@@ -429,10 +509,7 @@ pub async fn run_archive(
     // it is deliberately allowed through — being able to preview without a
     // writable archive mount is useful while you are still fixing the mount.
     if !dry_run {
-        let check = crate::health::check_archive_dir(&ctx.archive_dir);
-        if !check.ok {
-            anyhow::bail!("{}", check.detail);
-        }
+        preflight_writable(&ctx.archive_dir, &selected)?;
     }
 
     let months: Vec<plan::MonthContents> = selected
@@ -479,7 +556,7 @@ pub async fn run_archive(
                     o.failed,
                 )
             }
-            Err(e) => (RunStatus::Failed, Some(e.to_string()), 0, 0, Vec::new()),
+            Err(e) => (RunStatus::Failed, Some(chain(&e)), 0, 0, Vec::new()),
         };
 
         finish_run(&ctx.pool, run_id, status, message.clone(), done, bytes, &failed).await;
@@ -811,7 +888,7 @@ pub async fn run_restore(ctx: JobContext, target: CameraMonth) -> anyhow::Result
                     count as i64,
                 )
             }
-            Ok(Err(e)) => (RunStatus::Failed, e.to_string(), 0),
+            Ok(Err(e)) => (RunStatus::Failed, chain(&e), 0),
             Err(e) => (RunStatus::Failed, e.to_string(), 0),
         };
 
@@ -890,7 +967,7 @@ pub async fn run_verify(ctx: JobContext, target: CameraMonth) -> anyhow::Result<
                 format!("{read} of {total} entries read back without error"),
                 read as i64,
             ),
-            Ok(Err(e)) => (RunStatus::Failed, format!("archive is unreadable: {e}"), 0),
+            Ok(Err(e)) => (RunStatus::Failed, format!("archive is unreadable: {:#}", e), 0),
             Err(e) => (RunStatus::Failed, e.to_string(), 0),
         };
 
@@ -1280,6 +1357,53 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
         std::fs::set_permissions(&archive, perms).unwrap();
         std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    /// The failure that reached a user: the archive root was writable, so the
+    /// preflight passed, and the run then died inside the camera directory.
+    #[tokio::test]
+    async fn a_run_refuses_when_the_camera_directory_is_unwritable() {
+        if unsafe { crate::health::geteuid_for_tests() } == 0 {
+            return;
+        }
+
+        let e = env("readonly-camera").await;
+        // The layout the shell script this replaces leaves behind: the camera
+        // directory already exists, owned by whoever ran it.
+        let camera = e.root.join("archive/Front Door");
+        std::fs::create_dir_all(&camera).unwrap();
+        let mut perms = std::fs::metadata(&camera).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&camera, perms).unwrap();
+
+        let jobs = Jobs::default();
+        let err = run_archive(ctx(&e, &jobs), e.settings.clone(), Vec::new(), false, false)
+            .await
+            .expect_err("a writable root is not enough to promise the run can finish");
+
+        let message = err.to_string();
+        assert!(message.contains("Front Door"), "names the directory that refused: {message}");
+        assert!(message.contains("not writable"), "{message}");
+
+        let mut perms = std::fs::metadata(&camera).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&camera, perms).unwrap();
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    #[test]
+    fn a_reported_error_carries_its_cause_not_just_its_context() {
+        // The regression this guards: `.context("writing <path>")` around an
+        // io error rendered as the path alone, so a permission failure reached
+        // the run history looking like a run that failed with no error at all.
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let err = anyhow::Error::new(io).context("writing /archive/Front Door/2026-07.tar");
+
+        let rendered = chain(&err);
+        assert!(rendered.contains("writing /archive/Front Door/2026-07.tar"), "{rendered}");
+        assert!(rendered.contains("permission denied"), "the cause survives: {rendered}");
+        // And the plain Display really does drop it, which is why `chain` exists.
+        assert!(!err.to_string().contains("permission denied"));
     }
 
     #[tokio::test]

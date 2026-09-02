@@ -97,24 +97,80 @@ pub fn check_archive_dir(dir: &Path) -> Check {
         unsafe { libc_getegid() },
     );
 
-    // A fixed name, removed straight away. A pid-suffixed one would leave
-    // litter behind if the process were killed between create and remove, and
-    // health runs often enough for that to accumulate.
-    let probe = dir.join(".protect-manager-write-test");
-    let _ = std::fs::remove_file(&probe);
-    match std::fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            ok(format!("{} writable ({ids})", dir.display()))
-        }
-        Err(e) => fail(format!(
-            "{} is not writable: {e} — archiving will fail. Add the group owning it to \
-             `group_add`, or chown it to {}:{}. ({ids})",
+    if let Err(e) = probe_writable(dir) {
+        return fail(unwritable(dir, &e, &ids));
+    }
+
+    // The root being writable is not enough, and assuming it was is what let a
+    // permission failure through to a run. Archives land in
+    // `<archive>/<camera>/`, and this app writes the same layout as the shell
+    // script it replaces — so on any deployment that ran that script, those
+    // per-camera directories already exist and are owned by whoever ran it.
+    // A writable root beside an unwritable camera directory is the normal
+    // shape of this failure.
+    match unwritable_subdir(dir) {
+        Err(detail) => fail(detail),
+        Ok(checked) => ok(format!(
+            "{} writable, {checked} camera directories checked ({ids})",
             dir.display(),
-            unsafe { libc_geteuid() },
-            unsafe { libc_getegid() },
         )),
     }
+}
+
+/// Probe every existing camera directory, naming the first that refuses.
+///
+/// Returns how many were checked, so a green light says what it actually
+/// verified rather than implying more than it looked at.
+fn unwritable_subdir(dir: &Path) -> Result<usize, String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(0) };
+    let mut checked = 0usize;
+
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        checked += 1;
+        let path = entry.path();
+        if let Err(e) = probe_writable(&path) {
+            let ids = match std::fs::metadata(&path) {
+                Ok(m) => format!(
+                    "owned by {}:{}, we run as {}:{}",
+                    m.uid(),
+                    m.gid(),
+                    unsafe { libc_geteuid() },
+                    unsafe { libc_getegid() },
+                ),
+                Err(_) => "owner unknown".into(),
+            };
+            return Err(unwritable(&path, &e, &ids));
+        }
+    }
+    Ok(checked)
+}
+
+/// Can we create a file here? Asked by doing it.
+///
+/// A fixed probe name, removed straight away. A pid-suffixed one would leave
+/// litter behind if the process were killed between create and remove, and
+/// health runs often enough for that to accumulate.
+pub fn probe_writable(dir: &Path) -> std::io::Result<()> {
+    let probe = dir.join(".protect-manager-write-test");
+    let _ = std::fs::remove_file(&probe);
+    std::fs::write(&probe, b"")?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// One sentence for an unwritable directory, naming the fix rather than only
+/// the fault — the errno alone is what made this hard to act on.
+pub fn unwritable(dir: &Path, e: &std::io::Error, ids: &str) -> String {
+    format!(
+        "{} is not writable: {e} — archiving will fail. Add the group owning it to \
+         `group_add`, or chown it to {}:{}. ({ids})",
+        dir.display(),
+        unsafe { libc_geteuid() },
+        unsafe { libc_getegid() },
+    )
 }
 
 /// The effective uid, for tests that must skip when running as root.
@@ -163,16 +219,55 @@ mod tests {
         if unsafe { libc_geteuid() } != 0 {
             let locked = root.join("locked");
             std::fs::create_dir_all(&locked).unwrap();
-            let mut perms = std::fs::metadata(&locked).unwrap().permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
-            std::fs::set_permissions(&locked, perms).unwrap();
+            lock(&locked);
 
             let check = check_archive_dir(&locked);
             assert!(!check.ok, "{}", check.detail);
             assert!(check.detail.contains("not writable"), "{}", check.detail);
             assert!(check.detail.contains("group_add"), "the fix, not just the fault");
+            unlock(&locked);
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failure that actually reached a user: the archive root is writable,
+    /// so nothing complained, but the per-camera directory inside it was made
+    /// by the shell script this app replaces and is owned by someone else.
+    #[test]
+    fn an_unwritable_camera_directory_fails_the_check_even_when_the_root_is_fine() {
+        if unsafe { libc_geteuid() } == 0 {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("pm-health-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let camera = root.join("G4 Instant Wäscheplatz");
+        std::fs::create_dir_all(&camera).unwrap();
+
+        assert!(check_archive_dir(&root).ok, "a writable tree passes");
+
+        lock(&camera);
+        let check = check_archive_dir(&root);
+        assert!(!check.ok, "the root is writable, but the camera directory is not");
+        // The message has to name the directory that refused, not the root we
+        // happened to start from.
+        assert!(check.detail.contains("G4 Instant Wäscheplatz"), "{}", check.detail);
+        assert!(check.detail.contains("not writable"), "{}", check.detail);
+
+        unlock(&camera);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn lock(dir: &Path) {
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(dir, perms).unwrap();
+    }
+
+    fn unlock(dir: &Path) {
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(dir, perms).unwrap();
     }
 }

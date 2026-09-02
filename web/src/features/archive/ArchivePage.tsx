@@ -200,7 +200,14 @@ export function ArchivePage() {
                 </span>
                 {/* `basis-full` on a phone: the message is a sentence, and a
                     sentence sharing a line with four labels is a fragment. */}
-                <span className="min-w-0 basis-full truncate text-sm text-fg-dim @xl:flex-1 @xl:basis-auto">
+                {/* Truncated to keep the row one line, but a failure message
+                    names a path and a fix and is longer than the column — so
+                    the whole thing has to be reachable without leaving the
+                    page. */}
+                <span
+                  className="min-w-0 basis-full truncate text-sm text-fg-dim @xl:flex-1 @xl:basis-auto"
+                  title={r.message ?? undefined}
+                >
                   {r.message ?? "—"}
                 </span>
                 {r.failed_files.length > 0 && (
