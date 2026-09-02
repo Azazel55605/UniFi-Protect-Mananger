@@ -381,10 +381,8 @@ impl DirReport {
     /// Why the write was refused, in terms of the thing to go and change.
     pub fn explain(&self) -> Option<String> {
         let e = self.write.as_ref()?;
-        let (uid, gid, mode) = match &self.meta {
-            Some(m) => (m.uid(), m.gid(), m.mode() & 0o777),
-            None => return None,
-        };
+        let meta = self.meta.as_ref()?;
+        let (uid, gid, mode) = (meta.uid(), meta.gid(), meta.mode() & 0o777);
         let filesystem = self
             .mount
             .as_ref()
