@@ -215,7 +215,18 @@ pub struct CameraCandidate {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+/// Fallback age threshold for archiving, in days.
+///
+/// A month rather than a round number of weeks, because that is the unit the
+/// archives themselves are cut in — but expressed in days so it can actually
+/// be tuned.
+pub const DEFAULT_ARCHIVE_AFTER_DAYS: u32 = 30;
+
+fn default_archive_after_days() -> u32 {
+    DEFAULT_ARCHIVE_AFTER_DAYS
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = OUT)]
 pub struct Settings {
     pub upb_container_id: Option<String>,
@@ -225,10 +236,26 @@ pub struct Settings {
     pub clip_path_prefix: Option<String>,
     /// Camera directories the user confirmed.
     pub camera_dirs: Vec<String>,
-    /// How long clips stay viewable. The same number decides when they are
-    /// archived — one knob, phrased the way the user thinks about it.
+    /// How long clips are still expected to be on disk.
+    ///
+    /// This bounds the work the index does: only clips inside this window are
+    /// looked for on the filesystem, because anything older has been archived
+    /// by definition. It does *not* decide when archiving happens — see
+    /// `archive_after_days`.
     #[ts(type = "number")]
     pub live_window_months: u32,
+    /// How old the newest clip in a camera-month must be before that month is
+    /// offered for archiving.
+    ///
+    /// In days, and deliberately not in months. Archiving cuts whole calendar
+    /// months, so it is tempting to express the threshold in them too — but a
+    /// month counted back from the *current* month makes the real minimum age
+    /// anything from one to two months depending on today's date, with no way
+    /// to ask for less. That is what made archiving look broken on a
+    /// deployment only a few months old: nothing was ever due.
+    #[serde(default = "default_archive_after_days")]
+    #[ts(type = "number")]
+    pub archive_after_days: u32,
     /// Keep the originals after an archive verifies clean.
     ///
     /// Defaults to false — the sources are removed — because the backup
@@ -238,6 +265,23 @@ pub struct Settings {
     #[serde(default)]
     pub keep_sources_after_archive: bool,
     pub setup_complete: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            upb_container_id: None,
+            events_db_path: None,
+            clip_path_prefix: None,
+            camera_dirs: Vec::new(),
+            live_window_months: 0,
+            // Not zero: an unconfigured install must not read as "archive
+            // everything, including yesterday".
+            archive_after_days: DEFAULT_ARCHIVE_AFTER_DAYS,
+            keep_sources_after_archive: false,
+            setup_complete: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

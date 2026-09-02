@@ -29,6 +29,34 @@ impl MonthContents {
     pub fn key(&self) -> CameraMonth {
         CameraMonth { camera: self.camera.clone(), month: self.month.clone() }
     }
+
+    /// When the newest day present in this month ended, as Unix seconds.
+    ///
+    /// Age is measured from the day a clip *belongs to*, not from its mtime.
+    /// The two disagree whenever the backup service rewrites or backfills a
+    /// file, and the question being asked here is how old the footage is, not
+    /// how recently the file was touched. (`newest_write` answers the other
+    /// question, and guards a different hazard.)
+    pub fn newest_day_end(&self) -> Option<f64> {
+        self.day_dirs
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .filter_map(day_to_days)
+            .max()
+            .map(|days| (days + 1) as f64 * 86_400.0)
+    }
+}
+
+/// A `YYYY-MM-DD` directory name as days since the Unix epoch.
+fn day_to_days(name: &str) -> Option<i64> {
+    if !is_date_dir(name) {
+        return None;
+    }
+    Some(days_from_civil(
+        name[..4].parse().ok()?,
+        name[5..7].parse().ok()?,
+        name[8..].parse().ok()?,
+    ))
 }
 
 fn is_date_dir(name: &str) -> bool {
@@ -189,6 +217,32 @@ mod tests {
         assert!(months[0].files[0].1.starts_with("2026-06-29/"));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_months_age_is_measured_from_the_end_of_its_newest_day() {
+        let month = MonthContents {
+            camera: "Front Door".into(),
+            month: "2026-06".into(),
+            day_dirs: vec![
+                PathBuf::from("/backup/Front Door/2026-06-02"),
+                PathBuf::from("/backup/Front Door/2026-06-30"),
+                // Not a day directory, and must not be mistaken for the newest.
+                PathBuf::from("/backup/Front Door/thumbnails"),
+            ],
+            files: Vec::new(),
+            bytes: 0,
+            newest_write: None,
+        };
+
+        // Midnight at the start of 2026-07-01: the month is over, and its age
+        // is counted from there rather than from the start of the 30th.
+        assert_eq!(month.newest_day_end(), Some(days_from_civil(2026, 7, 1) as f64 * 86_400.0));
+
+        // A month with no day directories has no age to report, rather than
+        // an age of zero — which would read as "brand new" and hold it back.
+        let empty = MonthContents { day_dirs: Vec::new(), ..month };
+        assert_eq!(empty.newest_day_end(), None);
     }
 
     #[test]

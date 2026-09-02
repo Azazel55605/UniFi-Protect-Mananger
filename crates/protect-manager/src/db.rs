@@ -507,6 +507,32 @@ mod tests {
         assert_eq!(load_settings(&pool).await.unwrap().live_window_months, 6);
     }
 
+    /// Settings saved before the archiving threshold existed must still load,
+    /// and must not come back as zero — zero would read as "archive footage
+    /// from this morning", which is the one answer an upgrade must never
+    /// invent on the user's behalf.
+    #[tokio::test]
+    async fn settings_stored_before_the_threshold_existed_get_the_default() {
+        let pool = pool("settings-upgrade").await;
+        let legacy = r#"{"upb_container_id":"abc","events_db_path":"/backup/database/events.sqlite",
+            "clip_path_prefix":"/data","camera_dirs":["Front Door"],"live_window_months":2,
+            "setup_complete":true}"#;
+
+        sqlx::query("INSERT INTO settings (id, json, updated) VALUES (1, ?, 0)")
+            .bind(legacy)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let loaded = load_settings(&pool).await.unwrap();
+        assert_eq!(loaded.live_window_months, 2);
+        assert_eq!(
+            loaded.archive_after_days,
+            protect_api_types::DEFAULT_ARCHIVE_AFTER_DAYS
+        );
+        assert!(loaded.setup_complete, "an upgrade must not send anyone back to the wizard");
+    }
+
     #[tokio::test]
     async fn sessions_expire_and_revoke() {
         let pool = pool("sessions").await;

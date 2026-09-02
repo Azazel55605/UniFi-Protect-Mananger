@@ -250,8 +250,29 @@ pub fn validate(settings: &Settings, backup_dir: &Path) -> Vec<NamedCheck> {
             name: "Live window".into(),
             ok: true,
             detail: format!(
-                "clips stay viewable for at least {} months, then are archived",
+                "clips are expected on disk for {} months, which bounds what the index looks for",
                 settings.live_window_months
+            ),
+        }
+    });
+
+    // Reported separately from the live window because they answer different
+    // questions, and conflating them is what made archiving look broken: the
+    // window is about where a clip is expected to be, this is about when we
+    // are allowed to move it.
+    checks.push(if settings.archive_after_days == 0 {
+        NamedCheck {
+            name: "Archive after".into(),
+            ok: false,
+            detail: "not set".into(),
+        }
+    } else {
+        NamedCheck {
+            name: "Archive after".into(),
+            ok: true,
+            detail: format!(
+                "a month is offered for archiving once its newest clip is {} days old",
+                settings.archive_after_days
             ),
         }
     });

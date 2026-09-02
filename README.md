@@ -19,8 +19,8 @@ storage on a schedule, and see whether the pipeline is actually working.
 - Camera directories identified by evidence (dated folders holding clips),
   not by excluding a hardcoded list of known non-camera names
 - Health checks: Docker socket, container state, clip-directory readability,
-  and a warning if the backup service's retention is shorter than your live
-  window — which would delete footage before it is ever archived
+  and a warning if the backup service's retention is shorter than your
+  archiving threshold — which would delete footage before it is ever archived
 - Live container logs streamed over an authenticated WebSocket
 - An event index rebuilt on a timer from the backup service's own database,
   with camera names and detection types recovered from clip paths — neither is
@@ -31,6 +31,10 @@ storage on a schedule, and see whether the pipeline is actually working.
   clip, which catches a backup service that is running but no longer capturing
 - A watchdog for the backup service's known failure — still recording events,
   no longer downloading them — with an optional webhook and an opt-in restart
+- An archiving threshold in days, editable from Settings and from the archive
+  page itself, deciding how old a month's newest clip must be before it is
+  offered for archiving — separate from the live window, which only bounds how
+  far back the index looks for files on disk
 - Archiving that packs each camera-month into an uncompressed `.tar`, reads it
   back and compares every file against its hash, and only then removes the
   originals — with a dry run that writes nothing

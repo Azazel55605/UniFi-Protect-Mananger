@@ -349,10 +349,26 @@ clip_path_prefix: string | null,
  */
 camera_dirs: Array<string>, 
 /**
- * How long clips stay viewable. The same number decides when they are
- * archived — one knob, phrased the way the user thinks about it.
+ * How long clips are still expected to be on disk.
+ *
+ * This bounds the work the index does: only clips inside this window are
+ * looked for on the filesystem, because anything older has been archived
+ * by definition. It does *not* decide when archiving happens — see
+ * `archive_after_days`.
  */
 live_window_months: number, 
+/**
+ * How old the newest clip in a camera-month must be before that month is
+ * offered for archiving.
+ *
+ * In days, and deliberately not in months. Archiving cuts whole calendar
+ * months, so it is tempting to express the threshold in them too — but a
+ * month counted back from the *current* month makes the real minimum age
+ * anything from one to two months depending on today's date, with no way
+ * to ask for less. That is what made archiving look broken on a
+ * deployment only a few months old: nothing was ever due.
+ */
+archive_after_days: number, 
 /**
  * Keep the originals after an archive verifies clean.
  *

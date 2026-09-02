@@ -530,27 +530,33 @@ async fn health_handler(
                     {
                         running = insp.running;
 
-                        // If UPB's retention is ever shorter than the live
-                        // window it deletes clips before we archive them —
-                        // silent loss nothing else would notice.
-                        let live_window = db::load_settings(&state.pool)
+                        // If UPB's retention is ever shorter than the age a
+                        // month must reach to be archived, it deletes clips
+                        // before we ever pack them — silent loss nothing else
+                        // would notice. Compared against the archiving
+                        // threshold rather than the live window: the live
+                        // window is about where a clip is expected to be, and
+                        // using it here made this warning fire, or stay quiet,
+                        // for the wrong number.
+                        let archive_after_days = db::load_settings(&state.pool)
                             .await
-                            .map(|s| s.live_window_months)
+                            .map(|s| s.archive_after_days)
                             .unwrap_or(0);
-                        match (&insp.retention, live_window) {
-                            (Some(r), w) if w > 0 => match parse_retention_days(r) {
-                                Some(days) if days < (w as u64) * 28 => warnings.push(format!(
-                                    "UPB retention is {r}, shorter than the {w}-month live \
-                                     window — clips will be deleted before they are archived"
+                        match (&insp.retention, archive_after_days) {
+                            (Some(r), d) if d > 0 => match parse_retention_days(r) {
+                                Some(days) if days < d as u64 => warnings.push(format!(
+                                    "UPB retention is {r}, shorter than the {d}-day archiving \
+                                     threshold — clips will be deleted before they are archived"
                                 )),
                                 Some(_) => {}
                                 None => info.push(format!(
                                     "UPB retention is {r}, which could not be compared to the \
-                                     live window"
+                                     archiving threshold"
                                 )),
                             },
                             (Some(r), _) => info.push(format!(
-                                "UPB retention is {r} — will be checked once the live window is set"
+                                "UPB retention is {r} — will be checked once the archiving \
+                                 threshold is set"
                             )),
                             _ => {}
                         }
@@ -567,16 +573,16 @@ async fn health_handler(
                             // window that reaches into archivable months breaks
                             // that assumption — it can write into a month we
                             // are about to pack and delete.
-                            if let (Some(backfill), w @ 1..) =
-                                (upb::reconcile::parse_duration_secs(m), live_window)
+                            if let (Some(backfill), d @ 1..) =
+                                (upb::reconcile::parse_duration_secs(m), archive_after_days)
                             {
-                                let archivable_after = (w as f64) * 28.0 * 86_400.0;
+                                let archivable_after = (d as f64) * 86_400.0;
                                 if backfill >= archivable_after {
                                     warnings.push(format!(
                                         "UPB backfills up to {m}, which reaches into months old \
-                                         enough to archive ({w}-month live window). It could write \
-                                         into a month while it is being packed — raise the live \
-                                         window above the backfill range."
+                                         enough to archive ({d}-day threshold). It could write \
+                                         into a month while it is being packed — raise the \
+                                         archiving threshold above the backfill range."
                                     ));
                                 }
                             }

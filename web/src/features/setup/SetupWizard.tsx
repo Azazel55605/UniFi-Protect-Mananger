@@ -42,6 +42,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
           ? saved.camera_dirs
           : discovery.data.cameras.filter((c) => c.looks_like_camera).map((c) => c.dir_name),
       live_window_months: saved.live_window_months || 2,
+      archive_after_days: saved.archive_after_days || 30,
       keep_sources_after_archive: saved.keep_sources_after_archive,
       setup_complete: saved.setup_complete,
     });
@@ -72,7 +73,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
     !draft.upb_container_id,
     !draft.events_db_path || !draft.clip_path_prefix,
     draft.camera_dirs.length === 0,
-    draft.live_window_months < 1,
+    draft.live_window_months < 1 || draft.archive_after_days < 1,
     false,
   ];
 
@@ -240,30 +241,56 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
           )}
 
           {step === 3 && (
-            <div className="max-w-sm">
-              <label className="eyebrow mb-1.5 block">Keep clips viewable for</label>
-              <div className="flex items-center gap-3">
-                <Input
-                  type="number"
-                  min={1}
-                  max={120}
-                  className="data w-24"
-                  value={draft.live_window_months}
-                  onChange={(e) =>
-                    set({ live_window_months: Number(e.target.value) || 0 })
-                  }
-                />
-                <span className="text-sm text-fg-dim">months</span>
+            <div className="max-w-sm space-y-6">
+              <div>
+                <label className="eyebrow mb-1.5 block">Archive clips older than</label>
+                <div className="flex items-center gap-3">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={3650}
+                    className="data w-24"
+                    value={draft.archive_after_days}
+                    onChange={(e) =>
+                      set({ archive_after_days: Number(e.target.value) || 0 })
+                    }
+                  />
+                  <span className="text-sm text-fg-dim">days</span>
+                </div>
+                <p className="mt-3 text-sm text-fg-dim">
+                  Clips past this age are packed into one archive per camera per month
+                  and removed from the live directory. This is the only setting
+                  controlling disk growth — the backup service never deletes anything
+                  itself.
+                </p>
+                <p className="mt-3 text-xs text-fg-faint">
+                  Archives cover whole calendar months, so a month waits until its
+                  newest clip passes this age. The month being written to right now is
+                  never archived.
+                </p>
               </div>
-              <p className="mt-3 text-sm text-fg-dim">
-                Older clips are packed into one archive per camera per month and removed
-                from the live directory. This is the only setting controlling disk
-                growth — the backup service never deletes anything itself.
-              </p>
-              <p className="mt-3 text-xs text-fg-faint">
-                Archives cover whole calendar months, so clips stay viewable for at least
-                this long and up to a month longer.
-              </p>
+
+              <div>
+                <label className="eyebrow mb-1.5 block">Expect clips on disk for</label>
+                <div className="flex items-center gap-3">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={120}
+                    className="data w-24"
+                    value={draft.live_window_months}
+                    onChange={(e) =>
+                      set({ live_window_months: Number(e.target.value) || 0 })
+                    }
+                  />
+                  <span className="text-sm text-fg-dim">months</span>
+                </div>
+                <p className="mt-3 text-xs text-fg-faint">
+                  How far back the index looks for files on disk before assuming they
+                  have been archived. Keep it comfortably longer than the threshold
+                  above; it does not itself trigger archiving.
+                </p>
+              </div>
             </div>
           )}
 
@@ -274,6 +301,7 @@ export function SetupWizard({ onDone }: { onDone: () => void }) {
                 ["Database", draft.events_db_path],
                 ["Path prefix", draft.clip_path_prefix],
                 ["Cameras", draft.camera_dirs.join(", ")],
+                ["Archive after", `${draft.archive_after_days} days`],
                 ["Live window", `${draft.live_window_months} months`],
               ].map(([k, v]) => (
                 <div key={k} className="flex gap-4 border-b border-line pb-2.5">

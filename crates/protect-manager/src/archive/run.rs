@@ -278,7 +278,15 @@ pub async fn due_months(
     backup_dir: &Path,
     archives: &[ArchiveEntry],
 ) -> anyhow::Result<Vec<DueEntry>> {
-    let cutoff = plan::cutoff_month(now(), settings.live_window_months);
+    let now = now();
+    // The current calendar month is never eligible, whatever the threshold
+    // says: a month is archived whole or not at all, and this one is still
+    // being written to.
+    let current_month = plan::cutoff_month(now, 0);
+    // Clamped to a day, because zero would mean "archive footage recorded this
+    // morning" and nothing below would catch it — `RECENT_WRITE_SECS` guards
+    // an hour, not a day.
+    let min_age = settings.archive_after_days.max(1) as f64 * 86_400.0;
     let pinned: Vec<(String, String)> =
         sqlx::query("SELECT camera, month FROM archives WHERE pinned = 1")
             .fetch_all(pool)
@@ -290,14 +298,17 @@ pub async fn due_months(
     let mut due = Vec::new();
     for camera in &settings.camera_dirs {
         for month in plan::months_for_camera(backup_dir, camera) {
-            // Whole months only, and only ones entirely past the live window.
-            if month.month >= cutoff || month.files.is_empty() {
+            // Whole months only, and never the one still being written to.
+            if month.month >= current_month || month.files.is_empty() {
                 continue;
             }
             let written_recently = month
                 .newest_write
-                .map(|at| now() - at < RECENT_WRITE_SECS)
+                .map(|at| now - at < RECENT_WRITE_SECS)
                 .unwrap_or(false);
+            // A month with no readable day directory has no age we can trust,
+            // so it is held rather than archived on a guess.
+            let age = month.newest_day_end().map(|end| now - end);
 
             let blocked = if pinned.iter().any(|(c, m)| c == camera && *m == month.month) {
                 Some("restored and pinned — release it to allow archiving".to_string())
@@ -311,6 +322,19 @@ pub async fn due_months(
                     "the backup service wrote to this month within the last hour —                      archiving would risk capturing a clip mid-write"
                         .to_string(),
                 )
+            } else if let Some(days) = age
+                .filter(|a| *a < min_age)
+                .map(|a| (a / 86_400.0).floor() as i64)
+            {
+                // Said as a countdown rather than a rule: the question being
+                // asked is "why not this one", and the answer that helps is
+                // when it changes.
+                Some(format!(
+                    "{days} days old — archived at {}",
+                    plural_days(settings.archive_after_days.max(1)),
+                ))
+            } else if age.is_none() {
+                Some("no dated clip folders, so its age is unknown".to_string())
             } else {
                 None
             };
@@ -326,6 +350,10 @@ pub async fn due_months(
     }
     due.sort_by(|a, b| a.month.cmp(&b.month).then(a.camera.cmp(&b.camera)));
     Ok(due)
+}
+
+fn plural_days(n: u32) -> String {
+    if n == 1 { "1 day".into() } else { format!("{n} days") }
 }
 
 /// The oldest camera-month present on disk, whether or not it is due.
@@ -922,6 +950,7 @@ mod tests {
         let settings = Settings {
             camera_dirs: vec!["Front Door".into()],
             live_window_months: 1,
+            archive_after_days: 30,
             setup_complete: true,
             ..Default::default()
         };
@@ -958,7 +987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_months_past_the_live_window_are_due() {
+    async fn the_current_month_is_never_due() {
         let e = env("due").await;
         let overview =
             overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
@@ -968,6 +997,41 @@ mod tests {
         // Two months exist on disk; only the older one is eligible.
         assert_eq!(overview.due.len(), 1, "the current month must not be archived");
         assert_eq!(overview.due[0].file_count, 6);
+
+        std::fs::remove_dir_all(&e.root).unwrap();
+    }
+
+    /// The bug this replaced: the threshold was a whole-month count stepped
+    /// back from the current month, so its minimum was somewhere between one
+    /// and two months depending on today's date, and nothing shorter could be
+    /// asked for. A deployment a few months old had nothing due, ever.
+    #[tokio::test]
+    async fn the_age_threshold_is_in_days_and_can_be_short() {
+        let mut e = env("days").await;
+
+        // The fixture's old month is three months back, so it clears any
+        // short threshold whatever today's date is.
+        e.settings.archive_after_days = 14;
+        let short =
+            overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
+                .await
+                .unwrap();
+        assert_eq!(short.due.iter().filter(|d| d.blocked.is_none()).count(), 1);
+
+        // And a threshold longer than the footage holds it back with a reason
+        // that says when it changes, rather than hiding it.
+        e.settings.archive_after_days = 3650;
+        let long =
+            overview(&e.pool, &e.settings, &e.root.join("backup"), &e.root.join("archive"))
+                .await
+                .unwrap();
+        assert_eq!(long.due.iter().filter(|d| d.blocked.is_none()).count(), 0);
+        let held = long.due.iter().find(|d| d.blocked.is_some()).expect("held, not hidden");
+        assert!(
+            held.blocked.as_deref().unwrap().contains("archived at 3650 days"),
+            "{:?}",
+            held.blocked
+        );
 
         std::fs::remove_dir_all(&e.root).unwrap();
     }
@@ -1124,7 +1188,7 @@ mod tests {
         // would be useless exactly when you want to test the mechanism.
         let e = env("preview").await;
         let mut settings = e.settings.clone();
-        settings.live_window_months = 120; // nothing can possibly be due
+        settings.archive_after_days = 3650; // nothing can possibly be due
 
         let jobs = Jobs::default();
         let rx = jobs.progress.subscribe();
@@ -1144,10 +1208,10 @@ mod tests {
     #[tokio::test]
     async fn a_real_run_with_nothing_due_does_not_invent_work() {
         // The fallback is a dry-run affordance only. A real run must never
-        // archive a month that is still inside the live window.
+        // archive a month that has not reached the age threshold.
         let e = env("nodue").await;
         let mut settings = e.settings.clone();
-        settings.live_window_months = 120;
+        settings.archive_after_days = 3650;
 
         let jobs = Jobs::default();
         let result = run_archive(ctx(&e, &jobs), settings, Vec::new(), false, false).await;

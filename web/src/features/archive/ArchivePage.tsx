@@ -15,6 +15,7 @@ import type {
 } from "@/lib/types.gen";
 import { useProgress, useProgressPercent } from "@/lib/progress";
 import { formatBytes } from "@/lib/format";
+import { RetentionPanel } from "@/features/settings/RetentionPanel";
 import { SchedulePanel } from "./SchedulePanel";
 
 export function ArchivePage() {
@@ -103,7 +104,7 @@ export function ArchivePage() {
             <p className="text-sm text-fg-dim">
               {blocked.length > 0
                 ? "Nothing left to archive — the months below are held back for the reasons shown."
-                : "Nothing is old enough to archive yet. Months move here once every day in them is past the live window."}
+                : "Nothing is old enough to archive yet. A month moves here once its newest clip passes the age threshold below."}
             </p>
           ) : (
             due.map((d) => {
@@ -144,6 +145,8 @@ export function ArchivePage() {
           {error != null && <ErrorNotice error={error} />}
         </PanelBody>
       </Panel>
+
+      <RetentionPanel compact />
 
       <SchedulePanel />
 
